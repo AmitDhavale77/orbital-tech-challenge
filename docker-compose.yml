@@ -24,6 +24,7 @@ services:
     volumes:
       - ./backend/src:/app/backend/src
       - ./backend/tests:/app/backend/tests
+      - ./synthetic-docs:/app/synthetic-docs:ro
       - ./alembic:/app/alembic
       - ./uploads:/app/uploads
       - ./pyproject.toml:/app/pyproject.toml
