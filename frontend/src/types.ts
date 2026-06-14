@@ -6,12 +6,20 @@ export interface Conversation {
 	has_document: boolean;
 }
 
+export interface Citation {
+	document_id: string;
+	document_name: string;
+	page: number;
+	quote: string;
+}
+
 export interface Message {
 	id: string;
 	conversation_id: string;
 	role: "user" | "assistant" | "system";
 	content: string;
 	sources_cited: number;
+	citations: Citation[];
 	created_at: string;
 }
 

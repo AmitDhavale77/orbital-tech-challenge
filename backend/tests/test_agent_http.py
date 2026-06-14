@@ -64,9 +64,15 @@ async def test_agent_answers_by_reading_pages(
                 )
             }
         else:
-            # Second turn: stream the final answer.
-            yield "The rent is "
-            yield "GBP 1.75 million."
+            # Second turn: emit the structured answer via the output tool.
+            yield {
+                0: DeltaToolCall(
+                    name=info.output_tools[0].name,
+                    json_args=json.dumps(
+                        {"markdown": "The rent is GBP 1.75 million.", "citations": []}
+                    ),
+                )
+            }
 
     with qa_agent.override(model=FunctionModel(stream_function=stream_function)):
         response = await client.post(

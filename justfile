@@ -96,6 +96,14 @@ fmt-frontend:
     docker compose exec frontend npm run fmt
 
 # =============================================================================
+# Tests
+# =============================================================================
+
+# Backend tests (pytest against a dedicated test database)
+test:
+    docker compose exec backend uv run pytest backend/tests
+
+# =============================================================================
 # Utilities
 # =============================================================================
 

@@ -5,14 +5,10 @@ from collections.abc import AsyncIterator
 import asyncpg
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from takehome.config import settings
 from takehome.db.models import Base
-
-# All tables, in FK-safe order for TRUNCATE ... CASCADE.
-_ALL_TABLES = "conversations, documents, pages, messages"
 
 
 def _split_url() -> tuple[str, str]:
@@ -51,11 +47,11 @@ async def sessionmaker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     """
     await _ensure_test_database()
     engine = create_async_engine(_test_db_url(), echo=False)
+    # Drop + recreate so the schema always matches the current models, picking up
+    # new columns/tables across tickets, and giving each test empty tables.
     async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
-        await conn.execute(
-            text(f"TRUNCATE {_ALL_TABLES} RESTART IDENTITY CASCADE")
-        )
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     try:
         yield maker

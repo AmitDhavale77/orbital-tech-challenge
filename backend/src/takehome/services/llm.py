@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 
@@ -18,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from takehome.services import (
     document as document_service,  # imports config → exports ANTHROPIC_API_KEY
 )
+from takehome.services.citations import Answer, verify_citations
 
 # Capable model for the reasoning/tool loop; Haiku is reserved for cheap aux
 # calls (conversation titles). See CLAUDE.md and docs/pydantic-ai.md.
@@ -25,10 +25,12 @@ QA_MODEL = "claude-sonnet-4-6"
 TITLE_MODEL = "anthropic:claude-haiku-4-5-20251001"
 
 # Bounds the worst-case latency/cost of the agentic loop (docs/pydantic-ai.md §9).
+# Sized to read a small bundle page-by-page (each read_page is one request); the
+# keyword search tool (ticket 04) is what keeps this from growing with doc count.
 CHAT_USAGE_LIMITS = UsageLimits(
-    request_limit=6,
-    tool_calls_limit=12,
-    total_tokens_limit=200_000,
+    request_limit=20,
+    tool_calls_limit=25,
+    total_tokens_limit=400_000,
 )
 
 INSTRUCTIONS = (
@@ -42,8 +44,12 @@ INSTRUCTIONS = (
     "Rules:\n"
     "- Base every statement on text you have actually read with `read_page`. "
     "Never guess or rely on prior knowledge of the document.\n"
-    "- If the bundle does not contain the answer, say \"Not specified\" rather "
-    "than speculating.\n"
+    "- Support each factual claim with a citation: the document, the page, and a "
+    "`quote` copied VERBATIM from that page's text (the quote is checked against "
+    "the page, so it must match exactly). Add `[1]`, `[2]` markers in the markdown "
+    "matching the citation order.\n"
+    "- If the bundle does not contain the answer, say \"Not specified\" with no "
+    "citation rather than speculating.\n"
     "- Be concise and precise. Lawyers value accuracy over verbosity."
 )
 
@@ -66,6 +72,7 @@ _QA_SETTINGS = AnthropicModelSettings(
 qa_agent = Agent(
     AnthropicModel(QA_MODEL),
     deps_type=AppDeps,
+    output_type=Answer,  # structured output; str kept out of the union (forces it)
     instructions=INSTRUCTIONS,
     model_settings=_QA_SETTINGS,
     retries=2,
@@ -135,11 +142,13 @@ async def answer_question(
     conversation_id: str,
     question: str,
     history: Iterable[dict[str, str]],
-) -> AsyncIterator[str]:
-    """Stream the agent's answer to a question over the conversation's bundle.
+) -> AsyncIterator[str | Answer]:
+    """Stream the agent's answer over the conversation's bundle.
 
-    The question is the only prompt content — the agent reads pages on demand via
-    its tools, so no document text is ever placed in the prompt.
+    Yields markdown deltas (str) as they stream, then a final `Answer` whose
+    citations have been verified against their cited pages. The question is the
+    only prompt content — the agent reads pages on demand via its tools, so no
+    document text is ever placed in the prompt.
     """
     deps = AppDeps(db=db, conversation_id=conversation_id)
     async with qa_agent.run_stream(
@@ -148,8 +157,16 @@ async def answer_question(
         message_history=_to_model_history(history),
         usage_limits=CHAT_USAGE_LIMITS,
     ) as result:
-        async for delta in result.stream_text(delta=True):
-            yield delta
+        streamed = ""
+        async for partial in result.stream_output():
+            markdown = partial.markdown or ""
+            if markdown != streamed:
+                yield markdown[len(streamed) :]
+                streamed = markdown
+        answer = await result.get_output()
+
+    verified = await verify_citations(db, conversation_id, answer.citations)
+    yield Answer(markdown=answer.markdown, citations=verified)
 
 
 title_agent = Agent(TITLE_MODEL)
@@ -165,18 +182,3 @@ async def generate_title(user_message: str) -> str:
     if len(title) > 100:
         title = title[:97] + "..."
     return title
-
-
-def count_sources_cited(response: str) -> int:
-    """Count references to document sections, clauses, pages, etc.
-
-    Interim heuristic retained from the baseline; replaced by a real verified
-    citation count in ticket 02.
-    """
-    patterns = [
-        r"section\s+\d+",
-        r"clause\s+\d+",
-        r"page\s+\d+",
-        r"paragraph\s+\d+",
-    ]
-    return sum(len(re.findall(p, response, re.IGNORECASE)) for p in patterns)

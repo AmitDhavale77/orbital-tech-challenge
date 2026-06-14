@@ -13,8 +13,9 @@ from starlette.responses import StreamingResponse
 
 from takehome.db.models import Message
 from takehome.db.session import get_session
+from takehome.services.citations import Answer, Citation
 from takehome.services.conversation import get_conversation, update_conversation
-from takehome.services.llm import answer_question, count_sources_cited, generate_title
+from takehome.services.llm import answer_question, generate_title
 
 logger = structlog.get_logger()
 
@@ -32,6 +33,7 @@ class MessageOut(BaseModel):
     role: str
     content: str
     sources_cited: int
+    citations: list[Citation] = []
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -75,6 +77,7 @@ async def list_messages(
             role=m.role,
             content=m.content,
             sources_cited=m.sources_cited,
+            citations=[Citation.model_validate(c) for c in (m.citations or [])],
             created_at=m.created_at,
         )
         for m in messages
@@ -135,17 +138,21 @@ async def send_message(
 
         async with session_factory() as run_session:
             full_response = ""
+            final_answer: Answer | None = None
 
             try:
-                async for chunk in answer_question(
+                async for item in answer_question(
                     db=run_session,
                     conversation_id=conversation_id,
                     question=body.content,
                     history=conversation_history,
                 ):
-                    full_response += chunk
-                    event_data = json.dumps({"type": "content", "content": chunk})
-                    yield f"data: {event_data}\n\n"
+                    if isinstance(item, str):
+                        full_response += item
+                        event_data = json.dumps({"type": "content", "content": item})
+                        yield f"data: {event_data}\n\n"
+                    else:
+                        final_answer = item
 
             except Exception:
                 logger.exception(
@@ -157,14 +164,17 @@ async def send_message(
                 event_data = json.dumps({"type": "content", "content": error_msg})
                 yield f"data: {event_data}\n\n"
 
-            # Interim heuristic count; replaced by verified citations in #02.
-            sources = count_sources_cited(full_response)
+            # Verified citations are the source of truth; sources_cited derives from them.
+            content = final_answer.markdown if final_answer else full_response
+            verified = final_answer.citations if final_answer else []
+            citations_json = [c.model_dump() for c in verified]
 
             assistant_message = Message(
                 conversation_id=conversation_id,
                 role="assistant",
-                content=full_response,
-                sources_cited=sources,
+                content=content,
+                sources_cited=len(verified),
+                citations=citations_json,
             )
             run_session.add(assistant_message)
             await run_session.commit()
@@ -196,6 +206,7 @@ async def send_message(
                         "role": assistant_message.role,
                         "content": assistant_message.content,
                         "sources_cited": assistant_message.sources_cited,
+                        "citations": citations_json,
                         "created_at": assistant_message.created_at.isoformat(),
                     },
                 }
@@ -206,7 +217,7 @@ async def send_message(
             done_data = json.dumps(
                 {
                     "type": "done",
-                    "sources_cited": sources,
+                    "sources_cited": len(verified),
                     "message_id": assistant_message.id,
                 }
             )

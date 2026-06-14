@@ -1,5 +1,5 @@
 import { ChevronLeft, ChevronRight, FileText, Loader2 } from "lucide-react";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Document as PDFDocument, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
@@ -18,11 +18,21 @@ const DEFAULT_WIDTH = 400;
 
 interface DocumentViewerProps {
 	document: Document | null;
+	/** When set, the viewer jumps to this page (e.g. from a citation click). */
+	target?: { documentId: string; page: number } | null;
 }
 
-export function DocumentViewer({ document }: DocumentViewerProps) {
+export function DocumentViewer({ document, target }: DocumentViewerProps) {
 	const [numPages, setNumPages] = useState<number>(0);
 	const [currentPage, setCurrentPage] = useState(1);
+
+	// Jump to a cited page when a citation is clicked. Depends on the target
+	// object identity, so re-clicking the same page re-triggers the jump.
+	useEffect(() => {
+		if (target && target.page >= 1) {
+			setCurrentPage(target.page);
+		}
+	}, [target]);
 	const [pdfLoading, setPdfLoading] = useState(true);
 	const [pdfError, setPdfError] = useState<string | null>(null);
 	const [width, setWidth] = useState(DEFAULT_WIDTH);
