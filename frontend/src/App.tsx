@@ -4,7 +4,7 @@ import { ChatWindow } from "./components/ChatWindow";
 import { DocumentViewer } from "./components/DocumentViewer";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { useConversations } from "./hooks/use-conversations";
-import { useDocument } from "./hooks/use-document";
+import { useDocuments } from "./hooks/use-documents";
 import { useMessages } from "./hooks/use-messages";
 import type { Citation } from "./types";
 
@@ -34,10 +34,10 @@ export default function App() {
 	} = useMessages(selectedId);
 
 	const {
-		document,
+		documents,
 		upload,
-		refresh: refreshDocument,
-	} = useDocument(selectedId);
+		refresh: refreshDocuments,
+	} = useDocuments(selectedId);
 
 	const [viewerTarget, setViewerTarget] = useState<ViewerTarget | null>(null);
 
@@ -58,11 +58,11 @@ export default function App() {
 		async (file: File) => {
 			const doc = await upload(file);
 			if (doc) {
-				refreshDocument();
+				refreshDocuments();
 				refreshConversations();
 			}
 		},
-		[upload, refreshDocument, refreshConversations],
+		[upload, refreshDocuments, refreshConversations],
 	);
 
 	const handleCreate = useCallback(async () => {
@@ -87,14 +87,14 @@ export default function App() {
 					error={messagesError}
 					streaming={streaming}
 					streamingContent={streamingContent}
-					hasDocument={!!document}
+					hasDocument={documents.length > 0}
 					conversationId={selectedId}
 					onSend={handleSend}
 					onUpload={handleUpload}
 					onCitationClick={handleCitationClick}
 				/>
 
-				<DocumentViewer document={document} target={viewerTarget} />
+				<DocumentViewer documents={documents} target={viewerTarget} />
 			</div>
 		</TooltipProvider>
 	);

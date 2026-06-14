@@ -48,10 +48,9 @@ async def upload_document_endpoint(
     file: UploadFile,
     session: AsyncSession = Depends(get_session),
 ) -> DocumentOut:
-    """Upload a PDF document for a conversation.
+    """Upload a PDF document into a conversation's bundle.
 
-    Only one document per conversation is allowed. Returns 409 if a document
-    already exists.
+    A conversation owns many documents, so repeated uploads are accepted.
     """
     # Verify the conversation exists
     conversation = await get_conversation(session, conversation_id)
@@ -61,10 +60,7 @@ async def upload_document_endpoint(
     try:
         document = await upload_document(session, conversation_id, file)
     except ValueError as e:
-        error_message = str(e)
-        if "already has a document" in error_message:
-            raise HTTPException(status_code=409, detail=error_message) from e
-        raise HTTPException(status_code=400, detail=error_message) from e
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     logger.info(
         "Document uploaded",

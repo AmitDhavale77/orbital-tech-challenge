@@ -17,51 +17,49 @@ const MAX_WIDTH = 700;
 const DEFAULT_WIDTH = 400;
 
 interface DocumentViewerProps {
-	document: Document | null;
-	/** When set, the viewer jumps to this page (e.g. from a citation click). */
+	documents: Document[];
+	/** When set, the viewer opens this document at this page (citation click). */
 	target?: { documentId: string; page: number } | null;
 }
 
-export function DocumentViewer({ document, target }: DocumentViewerProps) {
-	const [numPages, setNumPages] = useState<number>(0);
+export function DocumentViewer({ documents, target }: DocumentViewerProps) {
+	const [activeId, setActiveId] = useState<string | null>(null);
 	const [currentPage, setCurrentPage] = useState(1);
-
-	// Jump to a cited page when a citation is clicked. Depends on the target
-	// object identity, so re-clicking the same page re-triggers the jump.
-	useEffect(() => {
-		if (target && target.page >= 1) {
-			setCurrentPage(target.page);
-		}
-	}, [target]);
-	const [pdfLoading, setPdfLoading] = useState(true);
-	const [pdfError, setPdfError] = useState<string | null>(null);
+	const [numPages, setNumPages] = useState(0);
+	// Track which document the loaded page-count / error belong to, so switching
+	// documents never shows the previous document's state.
+	const [loadedId, setLoadedId] = useState<string | null>(null);
+	const [error, setError] = useState<{ id: string; message: string } | null>(
+		null,
+	);
 	const [width, setWidth] = useState(DEFAULT_WIDTH);
 	const [dragging, setDragging] = useState(false);
 	const containerRef = useRef<HTMLDivElement>(null);
+
+	// Open the cited document at the cited page. Depends on the target object
+	// identity, so re-clicking the same citation re-triggers the jump.
+	useEffect(() => {
+		if (target) {
+			setActiveId(target.documentId);
+			setCurrentPage(target.page >= 1 ? target.page : 1);
+		}
+	}, [target]);
 
 	const handleMouseDown = useCallback(
 		(e: React.MouseEvent) => {
 			e.preventDefault();
 			setDragging(true);
-
 			const startX = e.clientX;
 			const startWidth = width;
-
 			const handleMouseMove = (moveEvent: MouseEvent) => {
 				const delta = startX - moveEvent.clientX;
-				const newWidth = Math.min(
-					MAX_WIDTH,
-					Math.max(MIN_WIDTH, startWidth + delta),
-				);
-				setWidth(newWidth);
+				setWidth(Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, startWidth + delta)));
 			};
-
 			const handleMouseUp = () => {
 				setDragging(false);
 				window.removeEventListener("mousemove", handleMouseMove);
 				window.removeEventListener("mouseup", handleMouseUp);
 			};
-
 			window.addEventListener("mousemove", handleMouseMove);
 			window.addEventListener("mouseup", handleMouseUp);
 		},
@@ -69,20 +67,29 @@ export function DocumentViewer({ document, target }: DocumentViewerProps) {
 	);
 
 	const pdfPageWidth = width - 48; // account for px-4 padding on each side
+	const active =
+		documents.find((d) => d.id === activeId) ?? documents[0] ?? null;
 
-	if (!document) {
+	if (!active) {
 		return (
 			<div
 				style={{ width }}
 				className="flex h-full flex-shrink-0 flex-col items-center justify-center border-l border-neutral-200 bg-neutral-50"
 			>
 				<FileText className="mb-3 h-10 w-10 text-neutral-300" />
-				<p className="text-sm text-neutral-400">No document uploaded</p>
+				<p className="text-sm text-neutral-400">No documents uploaded</p>
 			</div>
 		);
 	}
 
-	const pdfUrl = getDocumentUrl(document.id);
+	const pdfUrl = getDocumentUrl(active.id);
+	const isLoaded = loadedId === active.id;
+	const errorMessage = error?.id === active.id ? error.message : null;
+
+	const selectDocument = (id: string) => {
+		setActiveId(id);
+		setCurrentPage(1);
+	};
 
 	return (
 		<div
@@ -98,46 +105,60 @@ export function DocumentViewer({ document, target }: DocumentViewerProps) {
 				onMouseDown={handleMouseDown}
 			/>
 
-			{/* Header */}
-			<div className="flex items-center justify-between border-b border-neutral-100 px-4 py-3">
-				<div className="min-w-0">
+			{/* Header: document switcher (or single filename) */}
+			<div className="border-b border-neutral-100 px-4 py-3">
+				{documents.length > 1 ? (
+					<select
+						value={active.id}
+						onChange={(e) => selectDocument(e.target.value)}
+						className="w-full truncate rounded-md border border-neutral-200 bg-neutral-50 px-2 py-1.5 text-sm font-medium text-neutral-800 outline-none focus:border-neutral-400"
+					>
+						{documents.map((d) => (
+							<option key={d.id} value={d.id}>
+								{d.filename}
+							</option>
+						))}
+					</select>
+				) : (
 					<p className="truncate text-sm font-medium text-neutral-800">
-						{document.filename}
+						{active.filename}
 					</p>
-					<p className="text-xs text-neutral-400">
-						{document.page_count} page{document.page_count !== 1 ? "s" : ""}
-					</p>
-				</div>
+				)}
+				<p className="mt-1 text-xs text-neutral-400">
+					{active.page_count} page{active.page_count !== 1 ? "s" : ""}
+				</p>
 			</div>
 
 			{/* PDF content */}
 			<div className="flex-1 overflow-y-auto p-4">
-				{pdfError && (
+				{errorMessage && (
 					<div className="rounded-lg bg-red-50 p-3 text-sm text-red-600">
-						{pdfError}
+						{errorMessage}
 					</div>
 				)}
 
 				<PDFDocument
+					key={active.id}
 					file={pdfUrl}
 					onLoadSuccess={({ numPages: pages }) => {
 						setNumPages(pages);
-						setPdfLoading(false);
-						setPdfError(null);
+						setLoadedId(active.id);
 					}}
-					onLoadError={(error) => {
-						setPdfError(`Failed to load PDF: ${error.message}`);
-						setPdfLoading(false);
-					}}
+					onLoadError={(e) =>
+						setError({
+							id: active.id,
+							message: `Failed to load PDF: ${e.message}`,
+						})
+					}
 					loading={
 						<div className="flex items-center justify-center py-12">
 							<Loader2 className="h-6 w-6 animate-spin text-neutral-400" />
 						</div>
 					}
 				>
-					{!pdfLoading && !pdfError && (
+					{isLoaded && !errorMessage && (
 						<Page
-							pageNumber={currentPage}
+							pageNumber={Math.min(currentPage, numPages)}
 							width={pdfPageWidth}
 							loading={
 								<div className="flex items-center justify-center py-12">
@@ -150,7 +171,7 @@ export function DocumentViewer({ document, target }: DocumentViewerProps) {
 			</div>
 
 			{/* Page navigation */}
-			{numPages > 0 && (
+			{isLoaded && numPages > 0 && (
 				<div className="flex items-center justify-center gap-3 border-t border-neutral-100 px-4 py-2.5">
 					<Button
 						variant="ghost"
@@ -162,7 +183,7 @@ export function DocumentViewer({ document, target }: DocumentViewerProps) {
 						<ChevronLeft className="h-4 w-4" />
 					</Button>
 					<span className="text-xs text-neutral-500">
-						Page {currentPage} of {numPages}
+						Page {Math.min(currentPage, numPages)} of {numPages}
 					</span>
 					<Button
 						variant="ghost"
