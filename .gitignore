@@ -16,6 +16,12 @@ dist/
 uploads/*
 !uploads/.gitkeep
 
+# ScratchPad
+uploads/*
+!uploads/.gitkeep
+docs/*
+!docs/.gitkeep
+
 # Claude Code
 .claude/settings.local.json
 .claude/*.local.*
