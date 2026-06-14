@@ -59,6 +59,10 @@ class Message(Base):
     citations: Mapped[list[dict[str, str | int]] | None] = mapped_column(
         JSON, nullable=True
     )
+    # The agent's steps for this answer as JSON: [{kind, label, document_id, page}, ...]
+    steps: Mapped[list[dict[str, str | int | None]] | None] = mapped_column(
+        JSON, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")

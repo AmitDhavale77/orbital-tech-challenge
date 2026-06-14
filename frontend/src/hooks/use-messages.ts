@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../lib/api";
-import type { Message } from "../types";
+import type { Message, Step } from "../types";
 
 export function useMessages(conversationId: string | null) {
 	const [messages, setMessages] = useState<Message[]>([]);
@@ -8,6 +8,7 @@ export function useMessages(conversationId: string | null) {
 	const [error, setError] = useState<string | null>(null);
 	const [streaming, setStreaming] = useState(false);
 	const [streamingContent, setStreamingContent] = useState("");
+	const [streamingSteps, setStreamingSteps] = useState<Step[]>([]);
 	const abortRef = useRef<AbortController | null>(null);
 
 	const refresh = useCallback(async () => {
@@ -47,12 +48,14 @@ export function useMessages(conversationId: string | null) {
 				content,
 				sources_cited: 0,
 				citations: [],
+				steps: [],
 				created_at: new Date().toISOString(),
 			};
 
 			setMessages((prev) => [...prev, userMessage]);
 			setStreaming(true);
 			setStreamingContent("");
+			setStreamingSteps([]);
 			setError(null);
 
 			try {
@@ -66,6 +69,7 @@ export function useMessages(conversationId: string | null) {
 				const decoder = new TextDecoder();
 				let accumulated = "";
 				let buffer = "";
+				const collectedSteps: Step[] = [];
 
 				while (true) {
 					const { done, value } = await reader.read();
@@ -89,9 +93,22 @@ export function useMessages(conversationId: string | null) {
 								content?: string;
 								delta?: string;
 								message?: Message;
+								kind?: Step["kind"];
+								label?: string;
+								document_id?: string | null;
+								page?: number | null;
 							};
 
-							if (parsed.type === "delta" && parsed.delta) {
+							if (parsed.type === "step" && parsed.kind) {
+								const step: Step = {
+									kind: parsed.kind,
+									label: parsed.label ?? "",
+									document_id: parsed.document_id ?? null,
+									page: parsed.page ?? null,
+								};
+								collectedSteps.push(step);
+								setStreamingSteps((prev) => [...prev, step]);
+							} else if (parsed.type === "delta" && parsed.delta) {
 								accumulated += parsed.delta;
 								setStreamingContent(accumulated);
 							} else if (parsed.type === "content" && parsed.content) {
@@ -122,6 +139,7 @@ export function useMessages(conversationId: string | null) {
 						content: accumulated,
 						sources_cited: 0,
 						citations: [],
+						steps: collectedSteps,
 						created_at: new Date().toISOString(),
 					};
 					setMessages((prev) => [...prev, assistantMessage]);
@@ -136,6 +154,7 @@ export function useMessages(conversationId: string | null) {
 			} finally {
 				setStreaming(false);
 				setStreamingContent("");
+				setStreamingSteps([]);
 			}
 		},
 		[conversationId, streaming],
@@ -147,6 +166,7 @@ export function useMessages(conversationId: string | null) {
 		error,
 		streaming,
 		streamingContent,
+		streamingSteps,
 		send,
 		refresh,
 	};

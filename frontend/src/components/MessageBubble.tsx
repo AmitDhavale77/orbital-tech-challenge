@@ -6,7 +6,8 @@ import {
 	citationRemarkPlugins,
 	referencedCitationIndices,
 } from "../lib/citation-markers";
-import type { Citation, Message } from "../types";
+import type { Citation, Message, Step } from "../types";
+import { AgentSteps } from "./AgentSteps";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
 /** One inline, clickable reference marker rendered in place of a `[n]` token. */
@@ -109,11 +110,13 @@ function AssistantAnswer({
 interface MessageBubbleProps {
 	message: Message;
 	onCitationClick?: (citation: Citation) => void;
+	onStepClick?: (step: Step) => void;
 }
 
 export function MessageBubble({
 	message,
 	onCitationClick,
+	onStepClick,
 }: MessageBubbleProps) {
 	if (message.role === "system") {
 		return (
@@ -157,6 +160,7 @@ export function MessageBubble({
 				<Bot className="h-4 w-4 text-white" />
 			</div>
 			<div className="min-w-0 max-w-[80%]">
+				<AgentSteps steps={message.steps} onStepClick={onStepClick} />
 				<AssistantAnswer message={message} onCitationClick={onCitationClick} />
 			</div>
 		</motion.div>
@@ -165,20 +169,30 @@ export function MessageBubble({
 
 interface StreamingBubbleProps {
 	content: string;
+	steps?: Step[];
+	onStepClick?: (step: Step) => void;
 }
 
-export function StreamingBubble({ content }: StreamingBubbleProps) {
+export function StreamingBubble({
+	content,
+	steps = [],
+	onStepClick,
+}: StreamingBubbleProps) {
 	return (
 		<div className="flex gap-3 py-1.5">
 			<div className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-neutral-900">
 				<Bot className="h-4 w-4 text-white" />
 			</div>
 			<div className="min-w-0 max-w-[80%]">
+				{steps.length > 0 && (
+					<AgentSteps steps={steps} live onStepClick={onStepClick} />
+				)}
 				{content ? (
 					<div className="prose">
 						<Streamdown mode="streaming">{content}</Streamdown>
+						<span className="inline-block h-4 w-0.5 animate-pulse bg-neutral-400" />
 					</div>
-				) : (
+				) : steps.length === 0 ? (
 					<div className="flex items-center gap-1 py-2">
 						<span className="h-1.5 w-1.5 animate-pulse rounded-full bg-neutral-400" />
 						<span
@@ -190,8 +204,7 @@ export function StreamingBubble({ content }: StreamingBubbleProps) {
 							style={{ animationDelay: "0.3s" }}
 						/>
 					</div>
-				)}
-				<span className="inline-block h-4 w-0.5 animate-pulse bg-neutral-400" />
+				) : null}
 			</div>
 		</div>
 	);

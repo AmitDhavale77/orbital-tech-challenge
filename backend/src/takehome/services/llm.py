@@ -1,14 +1,19 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterable
+import asyncio
+from collections.abc import AsyncIterable, AsyncIterator, Iterable
 from dataclasses import dataclass
 
+from pydantic import BaseModel
 from pydantic_ai import Agent, ModelRetry, RunContext, UsageLimits
 from pydantic_ai.messages import (
+    AgentStreamEvent,
+    FunctionToolCallEvent,
     ModelMessage,
     ModelRequest,
     ModelResponse,
     TextPart,
+    ToolCallPart,
     UserPromptPart,
 )
 from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
@@ -57,6 +62,15 @@ INSTRUCTIONS = (
     "citation rather than speculating.\n"
     "- Be concise and precise. Lawyers value accuracy over verbosity."
 )
+
+
+class Step(BaseModel):
+    """One action the agent took to reach its answer (a streamed/persisted trace)."""
+
+    kind: str  # "search" | "read" | "list" | "tool"
+    label: str  # human-readable, e.g. 'Reading lease.pdf · p.4'
+    document_id: str | None = None
+    page: int | None = None
 
 
 @dataclass
@@ -161,36 +175,94 @@ def _to_model_history(history: Iterable[dict[str, str]]) -> list[ModelMessage]:
     return messages
 
 
+def _tool_step(part: ToolCallPart, names: dict[str, str]) -> Step:
+    """Build a human-readable Step from a tool call (no DB access — `names` is a
+    pre-fetched document-id → filename map, so this is safe to call mid-run)."""
+    try:
+        args = part.args_as_dict()
+    except Exception:
+        args = {}
+    if part.tool_name == "search":
+        query = str(args.get("query", "")).strip()
+        label = f"Searching the bundle for “{query}”" if query else "Searching the bundle"
+        return Step(kind="search", label=label)
+    if part.tool_name == "read_page":
+        document_id = str(args.get("document_id", "")) or None
+        page = args.get("page")
+        name = names.get(document_id or "", "a document")
+        return Step(
+            kind="read",
+            label=f"Reading {name} · p.{page}",
+            document_id=document_id,
+            page=int(page) if isinstance(page, int) else None,
+        )
+    if part.tool_name == "list_documents":
+        return Step(kind="list", label="Scanning the bundle")
+    return Step(kind="tool", label=f"Running {part.tool_name}")
+
+
 async def answer_question(
     db: AsyncSession,
     conversation_id: str,
     question: str,
     history: Iterable[dict[str, str]],
-) -> AsyncIterator[str | Answer]:
+) -> AsyncIterator[str | Step | Answer]:
     """Stream the agent's answer over the conversation's bundle.
 
-    Yields markdown deltas (str) as they stream, then a final `Answer` whose
-    citations have been verified against their cited pages. The question is the
-    only prompt content — the agent reads pages on demand via its tools, so no
-    document text is ever placed in the prompt.
+    Yields, in order of occurrence: `Step`s (the agent's tool actions, as they
+    happen), markdown deltas (`str`), and finally an `Answer` whose citations are
+    verified against their pages. The question is the only prompt content — the
+    agent reads pages on demand, so no document text is placed in the prompt.
     """
     deps = AppDeps(db=db, conversation_id=conversation_id)
-    async with qa_agent.run_stream(
-        question,
-        deps=deps,
-        message_history=_to_model_history(history),
-        usage_limits=CHAT_USAGE_LIMITS,
-    ) as result:
-        streamed = ""
-        async for partial in result.stream_output():
-            markdown = partial.markdown or ""
-            if markdown != streamed:
-                yield markdown[len(streamed) :]
-                streamed = markdown
-        answer = await result.get_output()
+    # Pre-fetch filenames so the event handler can label `read_page` steps without
+    # touching the DB session concurrently with the running agent.
+    docs = await document_service.list_documents_for_conversation(db, conversation_id)
+    names = {d.id: d.filename for d in docs}
 
-    verified = await verify_citations(db, conversation_id, answer.citations)
-    yield Answer(markdown=answer.markdown, citations=verified)
+    # The agent run (tools + streaming + verification) runs as a task and pushes
+    # items onto a queue; we yield them in arrival order so steps appear live.
+    queue: asyncio.Queue[str | Step | Answer | None] = asyncio.Queue()
+
+    async def on_event(
+        ctx: RunContext[AppDeps], event_stream: AsyncIterable[AgentStreamEvent]
+    ) -> None:
+        async for event in event_stream:
+            if isinstance(event, FunctionToolCallEvent):
+                queue.put_nowait(_tool_step(event.part, names))
+
+    async def run() -> None:
+        try:
+            async with qa_agent.run_stream(
+                question,
+                deps=deps,
+                message_history=_to_model_history(history),
+                usage_limits=CHAT_USAGE_LIMITS,
+                event_stream_handler=on_event,
+            ) as result:
+                streamed = ""
+                async for partial in result.stream_output():
+                    markdown = partial.markdown or ""
+                    if markdown != streamed:
+                        queue.put_nowait(markdown[len(streamed) :])
+                        streamed = markdown
+                answer = await result.get_output()
+            verified = await verify_citations(db, conversation_id, answer.citations)
+            queue.put_nowait(Answer(markdown=answer.markdown, citations=verified))
+        finally:
+            queue.put_nowait(None)  # sentinel: run finished (success or error)
+
+    task = asyncio.create_task(run())
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+        await task  # re-raise any error from the run so the caller can handle it
+    finally:
+        if not task.done():
+            task.cancel()
 
 
 title_agent = Agent(TITLE_MODEL)

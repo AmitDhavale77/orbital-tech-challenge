@@ -124,3 +124,50 @@ async def test_agent_searches_then_reads(
     events = _parse_sse(response.text)
     message = next(e["message"] for e in events if e.get("type") == "message")
     assert message["citations"][0]["document_id"] == lease_id
+
+
+async def test_agent_steps_stream_live_and_persist(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    conversation_id, lease_id, _ = await _seed_bundle(db_session)
+
+    async def stream_function(messages: list[ModelMessage], info: AgentInfo):
+        seen = _tool_returns(messages)
+        if seen == 0:
+            yield {0: DeltaToolCall(name="search", json_args=json.dumps({"query": "annual rent"}))}
+        elif seen == 1:
+            yield {0: DeltaToolCall(name="read_page", json_args=json.dumps({"document_id": lease_id, "page": 1}))}
+        else:
+            payload = {
+                "markdown": "Rent.[1]",
+                "citations": [
+                    {"document_id": lease_id, "document_name": "lease.pdf", "page": 1, "quote": "rent rent rent"}
+                ],
+            }
+            yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args=json.dumps(payload))}
+
+    with qa_agent.override(model=FunctionModel(stream_function=stream_function)):
+        response = await client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "What is the rent?"},
+        )
+
+    events = _parse_sse(response.text)
+
+    # Live: one step event per tool call, in order, with human labels, before the answer.
+    live_steps = [e for e in events if e.get("type") == "step"]
+    assert [s["kind"] for s in live_steps] == ["search", "read"]
+    assert "annual rent" in live_steps[0]["label"]
+    assert live_steps[1]["page"] == 1
+    assert live_steps[1]["document_id"] == lease_id
+    assert "lease.pdf" in live_steps[1]["label"]
+    types = [e.get("type") for e in events]
+    assert types.index("step") < types.index("message")
+
+    # Persisted: the final message carries the steps, and a reload returns them.
+    message = next(e["message"] for e in events if e.get("type") == "message")
+    assert [s["kind"] for s in message["steps"]] == ["search", "read"]
+
+    listed = await client.get(f"/api/conversations/{conversation_id}/messages")
+    assistant = next(m for m in listed.json() if m["role"] == "assistant")
+    assert [s["kind"] for s in assistant["steps"]] == ["search", "read"]

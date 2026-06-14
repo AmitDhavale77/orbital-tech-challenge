@@ -15,7 +15,7 @@ from takehome.db.models import Message
 from takehome.db.session import get_session
 from takehome.services.citations import Answer, Citation
 from takehome.services.conversation import get_conversation, update_conversation
-from takehome.services.llm import answer_question, generate_title
+from takehome.services.llm import Step, answer_question, generate_title
 
 logger = structlog.get_logger()
 
@@ -34,6 +34,7 @@ class MessageOut(BaseModel):
     content: str
     sources_cited: int
     citations: list[Citation] = []
+    steps: list[Step] = []
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -78,6 +79,7 @@ async def list_messages(
             content=m.content,
             sources_cited=m.sources_cited,
             citations=[Citation.model_validate(c) for c in (m.citations or [])],
+            steps=[Step.model_validate(s) for s in (m.steps or [])],
             created_at=m.created_at,
         )
         for m in messages
@@ -139,6 +141,7 @@ async def send_message(
         async with session_factory() as run_session:
             full_response = ""
             final_answer: Answer | None = None
+            steps: list[Step] = []
 
             try:
                 async for item in answer_question(
@@ -150,6 +153,10 @@ async def send_message(
                     if isinstance(item, str):
                         full_response += item
                         event_data = json.dumps({"type": "content", "content": item})
+                        yield f"data: {event_data}\n\n"
+                    elif isinstance(item, Step):
+                        steps.append(item)
+                        event_data = json.dumps({"type": "step", **item.model_dump()})
                         yield f"data: {event_data}\n\n"
                     else:
                         final_answer = item
@@ -168,6 +175,7 @@ async def send_message(
             content = final_answer.markdown if final_answer else full_response
             verified = final_answer.citations if final_answer else []
             citations_json = [c.model_dump() for c in verified]
+            steps_json = [s.model_dump() for s in steps]
 
             assistant_message = Message(
                 conversation_id=conversation_id,
@@ -175,6 +183,7 @@ async def send_message(
                 content=content,
                 sources_cited=len(verified),
                 citations=citations_json,
+                steps=steps_json,
             )
             run_session.add(assistant_message)
             await run_session.commit()
@@ -207,6 +216,7 @@ async def send_message(
                         "content": assistant_message.content,
                         "sources_cited": assistant_message.sources_cited,
                         "citations": citations_json,
+                        "steps": steps_json,
                         "created_at": assistant_message.created_at.isoformat(),
                     },
                 }

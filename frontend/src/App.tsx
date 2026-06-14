@@ -6,7 +6,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { useConversations } from "./hooks/use-conversations";
 import { useDocuments } from "./hooks/use-documents";
 import { useMessages } from "./hooks/use-messages";
-import type { Citation } from "./types";
+import type { Citation, Step } from "./types";
 
 interface ViewerTarget {
 	documentId: string;
@@ -30,6 +30,7 @@ export default function App() {
 		error: messagesError,
 		streaming,
 		streamingContent,
+		streamingSteps,
 		send,
 	} = useMessages(selectedId);
 
@@ -44,6 +45,12 @@ export default function App() {
 	const handleCitationClick = useCallback((citation: Citation) => {
 		// New object each click so the viewer re-jumps even to the same page.
 		setViewerTarget({ documentId: citation.document_id, page: citation.page });
+	}, []);
+
+	const handleStepClick = useCallback((step: Step) => {
+		if (step.document_id && step.page) {
+			setViewerTarget({ documentId: step.document_id, page: step.page });
+		}
 	}, []);
 
 	const handleSend = useCallback(
@@ -87,11 +94,13 @@ export default function App() {
 					error={messagesError}
 					streaming={streaming}
 					streamingContent={streamingContent}
+					streamingSteps={streamingSteps}
 					hasDocument={documents.length > 0}
 					conversationId={selectedId}
 					onSend={handleSend}
 					onUpload={handleUpload}
 					onCitationClick={handleCitationClick}
+					onStepClick={handleStepClick}
 				/>
 
 				<DocumentViewer documents={documents} target={viewerTarget} />

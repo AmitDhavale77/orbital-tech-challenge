@@ -13,6 +13,13 @@ export interface Citation {
 	quote: string;
 }
 
+export interface Step {
+	kind: "search" | "read" | "list" | "tool";
+	label: string;
+	document_id: string | null;
+	page: number | null;
+}
+
 export interface Message {
 	id: string;
 	conversation_id: string;
@@ -20,6 +27,7 @@ export interface Message {
 	content: string;
 	sources_cited: number;
 	citations: Citation[];
+	steps: Step[];
 	created_at: string;
 }
 
