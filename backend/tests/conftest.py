@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 import asyncpg
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from takehome.config import settings
@@ -47,10 +48,11 @@ async def sessionmaker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     """
     await _ensure_test_database()
     engine = create_async_engine(_test_db_url(), echo=False)
-    # Drop + recreate so the schema always matches the current models, picking up
-    # new columns/tables across tickets, and giving each test empty tables.
+    # Reset the schema so it always matches the current models — robust to tables
+    # dropped from the models across tickets — and give each test empty tables.
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+        await conn.execute(text("DROP SCHEMA public CASCADE"))
+        await conn.execute(text("CREATE SCHEMA public"))
         await conn.run_sync(Base.metadata.create_all)
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     try:

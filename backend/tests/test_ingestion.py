@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.db.models import Conversation, Page
-from takehome.services.document import upload_document
+from takehome.services.document import search_pages, upload_document
 
 
 def _make_pdf(pages: list[str]) -> bytes:
@@ -41,3 +41,19 @@ async def test_upload_creates_one_page_per_pdf_page(db_session: AsyncSession) ->
     assert "rent" in rows[0].text
     assert "break clause" in rows[1].text
     assert document.page_count == 2
+
+
+async def test_uploaded_pages_are_searchable(db_session: AsyncSession) -> None:
+    conversation = Conversation()
+    db_session.add(conversation)
+    await db_session.commit()
+
+    content = _make_pdf(
+        ["The tenant shall pay the rent quarterly.", "Break clause notice period."]
+    )
+    upload = UploadFile(filename="lease.pdf", file=io.BytesIO(content))
+    document = await upload_document(db_session, conversation.id, upload)
+
+    # The pages' full-text vectors are populated, so the document is searchable.
+    results = await search_pages(db_session, conversation.id, "rent")
+    assert any(r["document_id"] == document.id for r in results)

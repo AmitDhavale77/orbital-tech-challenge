@@ -38,9 +38,14 @@ INSTRUCTIONS = (
     "Document Bundle during due diligence.\n\n"
     "You cannot see any document text until you read it. Use your tools:\n"
     "- `list_documents()` to see the documents in the bundle and their page counts.\n"
-    "- `read_page(document_id, page)` to read one page's text on demand.\n\n"
-    "Workflow: call `list_documents()` first, then read the pages you need to "
-    "answer the question. Read more pages if the answer is not yet clear.\n\n"
+    "- `search(query)` to find candidate pages across the bundle by keyword; it "
+    "returns a preview fragment per hit to help you choose.\n"
+    "- `read_page(document_id, page)` to read one page's full text on demand.\n\n"
+    "Workflow: for anything but the smallest bundle, `search(query)` first to find "
+    "candidate pages, then `read_page` the ones that look relevant to read the full "
+    "page and quote from it — never quote from a search preview alone. Re-run "
+    "`search` with different keywords if needed. For a tiny bundle you may read pages "
+    "directly. Read more pages if the answer is not yet clear.\n\n"
     "Rules:\n"
     "- Base every statement on text you have actually read with `read_page`. "
     "Never guess or rely on prior knowledge of the document.\n"
@@ -98,6 +103,25 @@ async def list_documents(ctx: RunContext[AppDeps]) -> list[dict[str, str | int]]
         }
         for d in docs
     ]
+
+
+@qa_agent.tool
+async def search(ctx: RunContext[AppDeps], query: str) -> list[dict[str, str | int]]:
+    """Find the most relevant pages across the bundle by keyword.
+
+    Returns page-level hits — `document_id`, `document_name`, `page`, and a
+    `preview` (the keyword-in-context fragment) — diversified across documents so
+    a long document can't crowd out a short one. The preview is only a hint for
+    deciding what to open: call `read_page` on a hit to read the full page and
+    quote it. Re-run with different keywords if nothing relevant comes back.
+
+    Args:
+        query: keywords or a natural-language phrase (exact terms like dates,
+            clause numbers, and defined terms work best).
+    """
+    return await document_service.search_pages(
+        ctx.deps.db, ctx.deps.conversation_id, query
+    )
 
 
 @qa_agent.tool

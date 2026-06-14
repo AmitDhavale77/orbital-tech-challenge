@@ -7,13 +7,17 @@ from typing import cast
 import pymupdf  # PyMuPDF (typed; the legacy `fitz` alias ships no py.typed)
 import structlog
 from fastapi import UploadFile
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.config import settings
 from takehome.db.models import Document, Page
 
 logger = structlog.get_logger()
+
+# ts_headline options: no markup (so previews read cleanly) and a single short
+# fragment around the match.
+_HEADLINE_OPTIONS = "StartSel=,StopSel=,MaxFragments=1,MaxWords=40,MinWords=15"
 
 
 async def upload_document(
@@ -144,3 +148,57 @@ async def get_page_text(
     )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
+
+
+async def search_pages(
+    session: AsyncSession,
+    conversation_id: str,
+    query: str,
+    *,
+    per_document: int = 2,
+    limit: int = 8,
+) -> list[dict[str, str | int]]:
+    """Keyword search over the bundle: rank pages, return diversified hits.
+
+    Ranks pages by Postgres full-text relevance and returns the top hits as
+    `(document_id, document_name, page, preview)`, where `preview` is the
+    keyword-in-context fragment (`ts_headline`). A per-document cap stops a long
+    document from burying a short one (ADR-0002). The previews are routing hints:
+    the agent `read_page`s a hit to read the full page and quote it.
+    """
+    tsquery = func.websearch_to_tsquery("english", query)
+    rank = func.ts_rank(Page.tsv, tsquery)
+    preview = func.ts_headline("english", Page.text, tsquery, _HEADLINE_OPTIONS)
+    stmt = (
+        select(
+            Document.id,
+            Document.filename,
+            Page.page_number,
+            preview.label("preview"),
+        )
+        .join(Document, Page.document_id == Document.id)
+        .where(Document.conversation_id == conversation_id)
+        .where(Page.tsv.op("@@")(tsquery))
+        .order_by(rank.desc())
+        .limit(100)  # candidate pool, narrowed by the per-document cap below
+    )
+    rows = (await session.execute(stmt)).all()
+
+    # Per-document cap + global limit (rows are already ranked best-first).
+    seen: dict[str, int] = {}
+    results: list[dict[str, str | int]] = []
+    for document_id, filename, page_number, preview_text in rows:
+        if seen.get(document_id, 0) >= per_document:
+            continue
+        seen[document_id] = seen.get(document_id, 0) + 1
+        results.append(
+            {
+                "document_id": document_id,
+                "document_name": filename,
+                "page": page_number,
+                "preview": " ".join((preview_text or "").split()),
+            }
+        )
+        if len(results) >= limit:
+            break
+    return results
