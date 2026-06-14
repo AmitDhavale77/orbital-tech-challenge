@@ -64,3 +64,25 @@ class Document(Base):
     uploaded_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     conversation: Mapped[Conversation] = relationship(back_populates="documents")
+    pages: Mapped[list[Page]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        order_by="Page.page_number",
+    )
+
+
+class Page(Base):
+    """One page of a Document — the unit a Citation anchors to (ADR-0002)."""
+
+    __tablename__ = "pages"
+
+    id: Mapped[str] = mapped_column(
+        String, primary_key=True, default=lambda: uuid.uuid4().hex[:16]
+    )
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE")
+    )
+    page_number: Mapped[int] = mapped_column(Integer)  # 1-based
+    text: Mapped[str] = mapped_column(Text)
+
+    document: Mapped[Document] = relationship(back_populates="pages")

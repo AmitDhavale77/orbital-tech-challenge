@@ -14,8 +14,7 @@ from starlette.responses import StreamingResponse
 from takehome.db.models import Message
 from takehome.db.session import get_session
 from takehome.services.conversation import get_conversation, update_conversation
-from takehome.services.document import get_document_for_conversation
-from takehome.services.llm import chat_with_document, count_sources_cited, generate_title
+from takehome.services.llm import answer_question, count_sources_cited, generate_title
 
 logger = structlog.get_logger()
 
@@ -106,10 +105,6 @@ async def send_message(
 
     logger.info("User message saved", conversation_id=conversation_id, message_id=user_message.id)
 
-    # Load document text for the conversation
-    document = await get_document_for_conversation(session, conversation_id)
-    document_text: str | None = document.extracted_text if document else None
-
     # Load conversation history (exclude the message we just saved, it will be the user_message param)
     stmt = (
         select(Message)
@@ -129,52 +124,57 @@ async def send_message(
     is_first_message = user_msg_count == 0
 
     async def event_stream() -> AsyncIterator[str]:
-        """Generate SSE events with the streamed LLM response."""
-        full_response = ""
+        """Generate SSE events with the streamed agent response.
 
-        try:
-            async for chunk in chat_with_document(
-                user_message=body.content,
-                document_text=document_text,
-                conversation_history=conversation_history,
-            ):
-                full_response += chunk
-                event_data = json.dumps({"type": "content", "content": chunk})
-                yield f"data: {event_data}\n\n"
-
-        except Exception:
-            logger.exception(
-                "Error during LLM streaming",
-                conversation_id=conversation_id,
-            )
-            error_msg = "I'm sorry, an error occurred while generating a response. Please try again."
-            full_response = error_msg
-            event_data = json.dumps({"type": "content", "content": error_msg})
-            yield f"data: {event_data}\n\n"
-
-        # Count sources cited in the full response
-        sources = count_sources_cited(full_response)
-
-        # Save the assistant message to the database.
-        # We need a fresh session since the outer one may have been closed.
+        Opens a single session for the run: the agent's tools read pages on
+        demand through it, and the assistant message is persisted with it. A
+        fresh session is needed because the request-scoped one closes once the
+        StreamingResponse is returned.
+        """
         from takehome.db.session import async_session as session_factory
 
-        async with session_factory() as save_session:
+        async with session_factory() as run_session:
+            full_response = ""
+
+            try:
+                async for chunk in answer_question(
+                    db=run_session,
+                    conversation_id=conversation_id,
+                    question=body.content,
+                    history=conversation_history,
+                ):
+                    full_response += chunk
+                    event_data = json.dumps({"type": "content", "content": chunk})
+                    yield f"data: {event_data}\n\n"
+
+            except Exception:
+                logger.exception(
+                    "Error during agent run",
+                    conversation_id=conversation_id,
+                )
+                error_msg = "I'm sorry, an error occurred while generating a response. Please try again."
+                full_response = error_msg
+                event_data = json.dumps({"type": "content", "content": error_msg})
+                yield f"data: {event_data}\n\n"
+
+            # Interim heuristic count; replaced by verified citations in #02.
+            sources = count_sources_cited(full_response)
+
             assistant_message = Message(
                 conversation_id=conversation_id,
                 role="assistant",
                 content=full_response,
                 sources_cited=sources,
             )
-            save_session.add(assistant_message)
-            await save_session.commit()
-            await save_session.refresh(assistant_message)
+            run_session.add(assistant_message)
+            await run_session.commit()
+            await run_session.refresh(assistant_message)
 
             # Auto-generate title from first user message
             if is_first_message:
                 try:
                     title = await generate_title(body.content)
-                    await update_conversation(save_session, conversation_id, title)
+                    await update_conversation(run_session, conversation_id, title)
                     logger.info(
                         "Auto-generated conversation title",
                         conversation_id=conversation_id,

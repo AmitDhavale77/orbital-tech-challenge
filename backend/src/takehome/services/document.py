@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import os
 import uuid
+from typing import cast
 
-import fitz  # PyMuPDF
+import pymupdf  # PyMuPDF (typed; the legacy `fitz` alias ships no py.typed)
 import structlog
 from fastapi import UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.config import settings
-from takehome.db.models import Document
+from takehome.db.models import Document, Page
 
 logger = structlog.get_logger()
 
@@ -59,38 +60,47 @@ async def upload_document(
 
     logger.info("Saved uploaded PDF", filename=original_filename, path=file_path, size=len(content))
 
-    # Extract text using PyMuPDF
-    extracted_text = ""
+    # Extract text per page using PyMuPDF. Each page becomes a Page row — the
+    # unit the agent reads on demand and a Citation later anchors to (ADR-0002).
+    # `extracted_text` is kept populated for backward compatibility, but it is
+    # no longer the path the agent reads from.
+    page_texts: list[str] = []
     page_count = 0
     try:
-        doc = fitz.open(file_path)
+        doc = pymupdf.open(file_path)
         page_count = len(doc)
-        pages: list[str] = []
         for page_num in range(page_count):
             page = doc[page_num]
-            text = page.get_text()  # type: ignore[union-attr]
-            if text.strip():
-                pages.append(f"--- Page {page_num + 1} ---\n{text}")
-        extracted_text = "\n\n".join(pages)
+            # Default option ("text") returns a str; the stub widens the return.
+            page_texts.append(cast(str, page.get_text()))  # pyright: ignore[reportUnknownMemberType]
         doc.close()
     except Exception:
         logger.exception("Failed to extract text from PDF", filename=original_filename)
-        extracted_text = ""
+        page_texts = []
+        page_count = 0
+
+    blob = "\n\n".join(
+        f"--- Page {i + 1} ---\n{t}" for i, t in enumerate(page_texts) if t.strip()
+    )
 
     logger.info(
         "Extracted text from PDF",
         filename=original_filename,
         page_count=page_count,
-        text_length=len(extracted_text),
+        text_length=len(blob),
     )
 
-    # Create the document record
+    # Create the document record with one Page per PDF page.
     document = Document(
         conversation_id=conversation_id,
         filename=original_filename,
         file_path=file_path,
-        extracted_text=extracted_text if extracted_text else None,
+        extracted_text=blob if blob else None,
         page_count=page_count,
+        pages=[
+            Page(page_number=i + 1, text=text)
+            for i, text in enumerate(page_texts)
+        ],
     )
     session.add(document)
     await session.commit()
@@ -110,5 +120,40 @@ async def get_document_for_conversation(
 ) -> Document | None:
     """Get the document for a conversation, if one exists."""
     stmt = select(Document).where(Document.conversation_id == conversation_id)
+    result = await session.execute(stmt)
+    return result.scalars().first()
+
+
+async def list_documents_for_conversation(
+    session: AsyncSession, conversation_id: str
+) -> list[Document]:
+    """Return every Document in a conversation's bundle, oldest first."""
+    stmt = (
+        select(Document)
+        .where(Document.conversation_id == conversation_id)
+        .order_by(Document.uploaded_at.asc())
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def get_page_text(
+    session: AsyncSession,
+    conversation_id: str,
+    document_id: str,
+    page_number: int,
+) -> str | None:
+    """Return the text of one page, scoped to the conversation.
+
+    Returns None when the document is not in this conversation or the page does
+    not exist — the agent's `read_page` tool turns that into a ModelRetry.
+    """
+    stmt = (
+        select(Page.text)
+        .join(Document, Page.document_id == Document.id)
+        .where(Document.conversation_id == conversation_id)
+        .where(Page.document_id == document_id)
+        .where(Page.page_number == page_number)
+    )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()

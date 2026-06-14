@@ -23,6 +23,7 @@ services:
       - "${API_PORT:-8000}:8000"
     volumes:
       - ./backend/src:/app/backend/src
+      - ./backend/tests:/app/backend/tests
       - ./alembic:/app/alembic
       - ./uploads:/app/uploads
       - ./pyproject.toml:/app/pyproject.toml
