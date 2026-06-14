@@ -99,9 +99,13 @@ fmt-frontend:
 # Tests
 # =============================================================================
 
-# Backend tests (pytest against a dedicated test database)
+# Backend tests (pytest against a dedicated test database; excludes slow evals)
 test:
     docker compose exec backend uv run pytest backend/tests
+
+# Opt-in real-LLM eval suite (ticket 07) — calls the real model, costs API usage
+eval:
+    docker compose exec backend uv run pytest -m slow backend/tests/test_evals.py -v
 
 # =============================================================================
 # Utilities

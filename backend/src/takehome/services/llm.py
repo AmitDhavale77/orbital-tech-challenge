@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterable, AsyncIterator, Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from pydantic import BaseModel
 from pydantic_ai import Agent, ModelRetry, RunContext, UsageLimits
@@ -96,6 +97,12 @@ qa_agent = Agent(
     model_settings=_QA_SETTINGS,
     retries=2,
 )
+
+
+@qa_agent.instructions
+def todays_date(ctx: RunContext[AppDeps]) -> str:
+    """Inject today's date so the agent can resolve 'as at today' questions."""
+    return f"Today's date is {datetime.now(UTC):%d %B %Y}."
 
 
 @qa_agent.tool
