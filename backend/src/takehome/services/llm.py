@@ -43,7 +43,10 @@ INSTRUCTIONS = (
     "You are a precise assistant for commercial real estate lawyers reviewing a "
     "Document Bundle during due diligence.\n\n"
     "You cannot see any document text until you read it. Use your tools:\n"
-    "- `list_documents()` to see the documents in the bundle and their page counts.\n"
+    "- `list_documents()` to see the documents in the bundle, each with a routing "
+    "`card` (type, parties, date, topics, one-line). Cards are hints for choosing "
+    "what to open — treat them as guidance only: never quote or cite a card, and "
+    "never conclude a fact is absent from a card alone; search/read to confirm.\n"
     "- `search(query)` to find candidate pages across the bundle by keyword; it "
     "returns a preview fragment per hit to help you choose.\n"
     "- `read_page(document_id, page)` to read one page's full text on demand.\n\n"
@@ -106,24 +109,18 @@ def todays_date(ctx: RunContext[AppDeps]) -> str:
 
 
 @qa_agent.tool
-async def list_documents(ctx: RunContext[AppDeps]) -> list[dict[str, str | int]]:
+async def list_documents(ctx: RunContext[AppDeps]) -> list[dict[str, object]]:
     """List the documents in this conversation's bundle.
 
     Call this first. Returns one entry per document with its `document_id`,
-    `document_name`, and `page_count`. Use the `document_id` values with
-    `read_page`.
+    `document_name`, `page_count`, and a `card` (a routing summary: type,
+    parties, date/range, key topics, one-line). Use the cards to decide which
+    documents to `search`/`read_page` — they are hints only, never a source.
     """
     docs = await document_service.list_documents_for_conversation(
         ctx.deps.db, ctx.deps.conversation_id
     )
-    return [
-        {
-            "document_id": d.id,
-            "document_name": d.filename,
-            "page_count": d.page_count,
-        }
-        for d in docs
-    ]
+    return document_service.document_summaries(docs)
 
 
 @qa_agent.tool

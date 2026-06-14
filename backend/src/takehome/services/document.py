@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.config import settings
 from takehome.db.models import Document, Page
+from takehome.services import cards
 
 logger = structlog.get_logger()
 
@@ -90,6 +91,15 @@ async def upload_document(
         text_length=len(blob),
     )
 
+    # Generate a routing card (cheap model). Best-effort: a failure must not
+    # block the upload — the agent can still search/read without a card.
+    card: dict[str, object] | None = None
+    if blob:
+        try:
+            card = (await cards.generate_card(blob)).model_dump()
+        except Exception:
+            logger.exception("Failed to generate document card", filename=original_filename)
+
     # Create the document record with one Page per PDF page.
     document = Document(
         conversation_id=conversation_id,
@@ -97,6 +107,7 @@ async def upload_document(
         file_path=file_path,
         extracted_text=blob if blob else None,
         page_count=page_count,
+        card=card,
         pages=[
             Page(page_number=i + 1, text=text)
             for i, text in enumerate(page_texts)
@@ -126,6 +137,19 @@ async def list_documents_for_conversation(
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+def document_summaries(documents: list[Document]) -> list[dict[str, object]]:
+    """Routing summaries for `list_documents`: id, name, page count, and card."""
+    return [
+        {
+            "document_id": d.id,
+            "document_name": d.filename,
+            "page_count": d.page_count,
+            "card": d.card,
+        }
+        for d in documents
+    ]
 
 
 async def get_document_paths(

@@ -61,6 +61,23 @@ async def sessionmaker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
         await engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+async def _stub_card_agent(request: pytest.FixtureRequest) -> AsyncIterator[None]:
+    """Stub the Haiku card model so uploads in fast tests don't call the real LLM.
+
+    Opt-in `slow` evals keep the real model for end-to-end realism.
+    """
+    if request.node.get_closest_marker("slow"):
+        yield
+        return
+    from pydantic_ai.models.test import TestModel
+
+    from takehome.services.cards import card_agent
+
+    with card_agent.override(model=TestModel()):
+        yield
+
+
 @pytest.fixture
 async def db_session(
     sessionmaker: async_sessionmaker[AsyncSession],

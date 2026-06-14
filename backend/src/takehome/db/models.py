@@ -81,6 +81,9 @@ class Document(Base):
     file_path: Mapped[str] = mapped_column(String)
     extracted_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     page_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Routing card as JSON: {type, parties[], date_or_range, key_topics[], one_line}.
+    # A hint for the agent only — never a citable Source (ADR-0002).
+    card: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     conversation: Mapped[Conversation] = relationship(back_populates="documents")
