@@ -29,16 +29,30 @@ class Answer(BaseModel):
 
 
 _WHITESPACE = re.compile(r"\s+")
+_MARKER = re.compile(r"\[(\d+)\]")
+# Smart punctuation a model may reproduce differently from the PDF's text layer.
+_PUNCT = str.maketrans(
+    {
+        "“": '"',
+        "”": '"',  # curly double quotes
+        "‘": "'",
+        "’": "'",  # curly single quotes / apostrophe
+        "–": "-",
+        "—": "-",  # en / em dash
+        " ": " ",  # non-breaking space
+    }
+)
 
 
 def _normalize(text: str) -> str:
-    """Collapse whitespace runs to single spaces and strip.
+    """Collapse whitespace and normalise smart punctuation, then strip.
 
-    PDF extraction wraps lines and doubles spaces, so a verbatim quote rarely
-    matches byte-for-byte. Normalising whitespace makes the match robust while
-    staying faithful to the exact tokens (case preserved).
+    PDF extraction wraps lines and doubles spaces, and models reproduce curly
+    quotes / dashes inconsistently, so a verbatim quote rarely matches
+    byte-for-byte. This keeps the match robust while staying faithful to the
+    exact tokens (case preserved).
     """
-    return _WHITESPACE.sub(" ", text).strip()
+    return _WHITESPACE.sub(" ", text.translate(_PUNCT)).strip()
 
 
 def verify_quote(quote: str, page_text: str) -> bool:
@@ -49,22 +63,34 @@ def verify_quote(quote: str, page_text: str) -> bool:
     return needle in _normalize(page_text)
 
 
-async def verify_citations(
+async def verify_and_renumber(
     db: AsyncSession,
     conversation_id: str,
+    markdown: str,
     citations: list[Citation],
-) -> list[Citation]:
-    """Keep only citations whose quote is present on their cited page.
+) -> tuple[str, list[Citation]]:
+    """Verify each citation against its page and reconcile the answer's markers.
 
-    The page text is fetched independently (conversation-scoped); a citation to
-    an unknown document/page, or whose quote does not match, is dropped as
-    hallucinated (ADR-0002).
+    Keeps only citations whose quote is present on their cited page (an unknown
+    document/page or non-matching quote is dropped as hallucinated, ADR-0002),
+    then rewrites the `[n]` markers in `markdown` so the surviving citations are
+    numbered contiguously and every rendered marker resolves — a marker whose
+    citation was dropped is removed rather than left dangling.
+
+    Returns the rewritten markdown and the verified, renumbered citations.
     """
     verified: list[Citation] = []
-    for citation in citations:
+    old_to_new: dict[int, int] = {}
+    for old_number, citation in enumerate(citations, start=1):
         page_text = await document_service.get_page_text(
             db, conversation_id, citation.document_id, citation.page
         )
         if page_text is not None and verify_quote(citation.quote, page_text):
             verified.append(citation)
-    return verified
+            old_to_new[old_number] = len(verified)
+
+    def _rewrite(match: re.Match[str]) -> str:
+        number = int(match.group(1))
+        return f"[{old_to_new[number]}]" if number in old_to_new else ""
+
+    return _MARKER.sub(_rewrite, markdown), verified

@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from takehome.services import (
     document as document_service,  # imports config → exports ANTHROPIC_API_KEY
 )
-from takehome.services.citations import Answer, verify_citations
+from takehome.services.citations import Answer, verify_and_renumber
 
 # Capable model for the reasoning/tool loop; Haiku is reserved for cheap aux
 # calls (conversation titles). See CLAUDE.md and docs/pydantic-ai.md.
@@ -247,8 +247,10 @@ async def answer_question(
                         queue.put_nowait(markdown[len(streamed) :])
                         streamed = markdown
                 answer = await result.get_output()
-            verified = await verify_citations(db, conversation_id, answer.citations)
-            queue.put_nowait(Answer(markdown=answer.markdown, citations=verified))
+            markdown, verified = await verify_and_renumber(
+                db, conversation_id, answer.markdown, answer.citations
+            )
+            queue.put_nowait(Answer(markdown=markdown, citations=verified))
         finally:
             queue.put_nowait(None)  # sentinel: run finished (success or error)
 
