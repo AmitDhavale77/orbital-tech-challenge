@@ -11,6 +11,10 @@ export interface Citation {
 	document_name: string;
 	page: number;
 	quote: string;
+	// Server-computed for on-PDF highlighting; rects are [x0, y0, x1, y1] in PDF points.
+	rects: number[][];
+	page_width: number | null;
+	page_height: number | null;
 }
 
 export interface Step {

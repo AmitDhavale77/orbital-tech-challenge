@@ -13,7 +13,7 @@ from starlette.responses import StreamingResponse
 
 from takehome.db.models import Message
 from takehome.db.session import get_session
-from takehome.services.citations import Answer, Citation
+from takehome.services.citations import GroundedAnswer, VerifiedCitation
 from takehome.services.conversation import get_conversation, update_conversation
 from takehome.services.llm import Step, answer_question, generate_title
 
@@ -33,7 +33,7 @@ class MessageOut(BaseModel):
     role: str
     content: str
     sources_cited: int
-    citations: list[Citation] = []
+    citations: list[VerifiedCitation] = []
     steps: list[Step] = []
     created_at: datetime
 
@@ -78,7 +78,7 @@ async def list_messages(
             role=m.role,
             content=m.content,
             sources_cited=m.sources_cited,
-            citations=[Citation.model_validate(c) for c in (m.citations or [])],
+            citations=[VerifiedCitation.model_validate(c) for c in (m.citations or [])],
             steps=[Step.model_validate(s) for s in (m.steps or [])],
             created_at=m.created_at,
         )
@@ -140,7 +140,7 @@ async def send_message(
 
         async with session_factory() as run_session:
             full_response = ""
-            final_answer: Answer | None = None
+            final_answer: GroundedAnswer | None = None
             steps: list[Step] = []
 
             try:

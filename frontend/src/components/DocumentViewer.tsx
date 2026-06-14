@@ -16,10 +16,19 @@ const MIN_WIDTH = 280;
 const MAX_WIDTH = 700;
 const DEFAULT_WIDTH = 400;
 
+interface ViewerTarget {
+	documentId: string;
+	page: number;
+	rects?: number[][];
+	pageWidth?: number | null;
+	pageHeight?: number | null;
+}
+
 interface DocumentViewerProps {
 	documents: Document[];
-	/** When set, the viewer opens this document at this page (citation click). */
-	target?: { documentId: string; page: number } | null;
+	/** When set, the viewer opens this document at this page (citation click)
+	 * and highlights the quote's rects if present. */
+	target?: ViewerTarget | null;
 }
 
 export function DocumentViewer({ documents, target }: DocumentViewerProps) {
@@ -85,6 +94,20 @@ export function DocumentViewer({ documents, target }: DocumentViewerProps) {
 	const pdfUrl = getDocumentUrl(active.id);
 	const isLoaded = loadedId === active.id;
 	const errorMessage = error?.id === active.id ? error.message : null;
+
+	// Highlight the cited quote only while its own page of its own document is shown.
+	const displayedPage = numPages
+		? Math.min(currentPage, numPages)
+		: currentPage;
+	const showHighlights =
+		!!target &&
+		target.documentId === active.id &&
+		displayedPage === target.page &&
+		!!target.rects?.length &&
+		!!target.pageWidth;
+	const highlightScale = showHighlights
+		? pdfPageWidth / (target.pageWidth as number)
+		: 1;
 
 	const selectDocument = (id: string) => {
 		setActiveId(id);
@@ -157,15 +180,33 @@ export function DocumentViewer({ documents, target }: DocumentViewerProps) {
 					}
 				>
 					{isLoaded && !errorMessage && (
-						<Page
-							pageNumber={Math.min(currentPage, numPages)}
-							width={pdfPageWidth}
-							loading={
-								<div className="flex items-center justify-center py-12">
-									<Loader2 className="h-5 w-5 animate-spin text-neutral-300" />
-								</div>
-							}
-						/>
+						<div className="relative inline-block">
+							<Page
+								pageNumber={Math.min(currentPage, numPages)}
+								width={pdfPageWidth}
+								loading={
+									<div className="flex items-center justify-center py-12">
+										<Loader2 className="h-5 w-5 animate-spin text-neutral-300" />
+									</div>
+								}
+							/>
+							{showHighlights &&
+								target?.rects?.map((r) => {
+									const [x0 = 0, y0 = 0, x1 = 0, y1 = 0] = r;
+									return (
+										<div
+											key={`${x0}-${y0}-${x1}-${y1}`}
+											className="pointer-events-none absolute rounded-[1px] bg-yellow-300/40 ring-1 ring-yellow-500/40"
+											style={{
+												left: x0 * highlightScale,
+												top: y0 * highlightScale,
+												width: (x1 - x0) * highlightScale,
+												height: (y1 - y0) * highlightScale,
+											}}
+										/>
+									);
+								})}
+						</div>
 					)}
 				</PDFDocument>
 			</div>

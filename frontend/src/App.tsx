@@ -11,6 +11,9 @@ import type { Citation, Step } from "./types";
 interface ViewerTarget {
 	documentId: string;
 	page: number;
+	rects?: number[][];
+	pageWidth?: number | null;
+	pageHeight?: number | null;
 }
 
 export default function App() {
@@ -44,7 +47,13 @@ export default function App() {
 
 	const handleCitationClick = useCallback((citation: Citation) => {
 		// New object each click so the viewer re-jumps even to the same page.
-		setViewerTarget({ documentId: citation.document_id, page: citation.page });
+		setViewerTarget({
+			documentId: citation.document_id,
+			page: citation.page,
+			rects: citation.rects,
+			pageWidth: citation.page_width,
+			pageHeight: citation.page_height,
+		});
 	}, []);
 
 	const handleStepClick = useCallback((step: Step) => {

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from typing import cast
+from typing import Any, cast
 
 import pymupdf  # PyMuPDF (typed; the legacy `fitz` alias ships no py.typed)
 import structlog
@@ -126,6 +126,50 @@ async def list_documents_for_conversation(
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+async def get_document_paths(
+    session: AsyncSession, conversation_id: str
+) -> dict[str, str]:
+    """Map document_id → file_path for a conversation (for on-PDF highlighting)."""
+    stmt = select(Document.id, Document.file_path).where(
+        Document.conversation_id == conversation_id
+    )
+    result = await session.execute(stmt)
+    return {str(doc_id): str(path) for doc_id, path in result.all()}
+
+
+def compute_quote_rects(
+    file_path: str, page_number: int, quote: str
+) -> tuple[list[list[float]], float, float]:
+    """Locate `quote` on a page and return its bounding boxes + page dimensions.
+
+    Returns `(rects, width, height)` where each rect is `[x0, y0, x1, y1]` in PDF
+    points and width/height are the page size in points (so the frontend can
+    scale boxes to the rendered width). A quote that can't be located yields an
+    empty rect list — the viewer then lands on the page without a highlight
+    (ADR-0002 graceful degrade). Never raises.
+    """
+    rects: list[list[float]] = []
+    width = height = 0.0
+    try:
+        doc = pymupdf.open(file_path)
+        try:
+            page: Any = doc[page_number - 1]  # pymupdf Page is only loosely typed
+            width, height = float(page.rect.width), float(page.rect.height)
+            found = page.search_for(quote)
+            if not found:
+                # Fall back to the first sentence — long multi-line quotes are
+                # harder for search_for to match end-to-end.
+                head = quote.split(". ")[0].strip()
+                if head and head != quote:
+                    found = page.search_for(head)
+            rects = [[float(r.x0), float(r.y0), float(r.x1), float(r.y1)] for r in found]
+        finally:
+            doc.close()
+    except Exception:
+        logger.exception("Failed to compute quote rects", file_path=file_path)
+    return rects, width, height
 
 
 async def get_page_text(

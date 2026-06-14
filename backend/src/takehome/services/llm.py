@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from takehome.services import (
     document as document_service,  # imports config → exports ANTHROPIC_API_KEY
 )
-from takehome.services.citations import Answer, verify_and_renumber
+from takehome.services.citations import Answer, GroundedAnswer, verify_and_renumber
 
 # Capable model for the reasoning/tool loop; Haiku is reserved for cheap aux
 # calls (conversation titles). See CLAUDE.md and docs/pydantic-ai.md.
@@ -213,7 +213,7 @@ async def answer_question(
     conversation_id: str,
     question: str,
     history: Iterable[dict[str, str]],
-) -> AsyncIterator[str | Step | Answer]:
+) -> AsyncIterator[str | Step | GroundedAnswer]:
     """Stream the agent's answer over the conversation's bundle.
 
     Yields, in order of occurrence: `Step`s (the agent's tool actions, as they
@@ -229,7 +229,7 @@ async def answer_question(
 
     # The agent run (tools + streaming + verification) runs as a task and pushes
     # items onto a queue; we yield them in arrival order so steps appear live.
-    queue: asyncio.Queue[str | Step | Answer | None] = asyncio.Queue()
+    queue: asyncio.Queue[str | Step | GroundedAnswer | None] = asyncio.Queue()
 
     async def on_event(
         ctx: RunContext[AppDeps], event_stream: AsyncIterable[AgentStreamEvent]
@@ -257,7 +257,7 @@ async def answer_question(
             markdown, verified = await verify_and_renumber(
                 db, conversation_id, answer.markdown, answer.citations
             )
-            queue.put_nowait(Answer(markdown=markdown, citations=verified))
+            queue.put_nowait(GroundedAnswer(markdown=markdown, citations=verified))
         finally:
             queue.put_nowait(None)  # sentinel: run finished (success or error)
 
