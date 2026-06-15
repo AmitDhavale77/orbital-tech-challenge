@@ -68,3 +68,43 @@ async def test_verify_and_renumber_drops_orphan_markers_and_renumbers(
     assert [c.quote for c in verified] == ["Alpha clause", "Gamma clause"]
     # The dropped citation's marker is removed; survivors are contiguous [1], [2].
     assert new_markdown == "Rent is X.[1] Beta point. Use is Y.[2]"
+
+
+async def test_verify_corrects_a_misattributed_page(db_session: AsyncSession) -> None:
+    # Reading a whole document, the model often cites the wrong page for an
+    # otherwise-verbatim quote. The quote is genuinely in the document, just on a
+    # different page — so it must be kept (with its page corrected), not dropped.
+    conversation = Conversation()
+    db_session.add(conversation)
+    await db_session.flush()
+    document = Document(
+        conversation_id=conversation.id,
+        filename="lease.pdf",
+        file_path="/tmp/lease.pdf",
+        page_count=2,
+    )
+    document.pages = [
+        Page(page_number=1, text="Rent and review provisions."),
+        Page(page_number=2, text="The Tenant shall indemnify the Landlord against all losses."),
+    ]
+    db_session.add(document)
+    await db_session.commit()
+
+    markdown = "The tenant indemnifies the landlord.[1]"
+    citations = [
+        # Verbatim quote, but the model attributed it to page 1 (it is on page 2).
+        Citation(
+            document_id=document.id,
+            document_name="lease.pdf",
+            page=1,
+            quote="The Tenant shall indemnify the Landlord against all losses.",
+        )
+    ]
+
+    new_markdown, verified = await verify_and_renumber(
+        db_session, conversation.id, markdown, citations
+    )
+
+    assert len(verified) == 1, "the quote is in the document and must not be dropped"
+    assert verified[0].page == 2, "the cited page is corrected to where the quote is"
+    assert new_markdown == "The tenant indemnifies the landlord.[1]"

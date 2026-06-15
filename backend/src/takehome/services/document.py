@@ -249,6 +249,27 @@ async def get_document_text(
     return "\n\n".join(parts) if parts else None
 
 
+async def get_document_pages(
+    session: AsyncSession,
+    conversation_id: str,
+    document_id: str,
+) -> list[tuple[int, str]]:
+    """Return `(page_number, text)` for every page of a document, in order.
+
+    Used by citation verification to locate a quote anywhere in the document when
+    the model attributed it to the wrong page. Scoped to the conversation.
+    """
+    stmt = (
+        select(Page.page_number, Page.text)
+        .join(Document, Page.document_id == Document.id)
+        .where(Document.conversation_id == conversation_id)
+        .where(Page.document_id == document_id)
+        .order_by(Page.page_number.asc())
+    )
+    rows = (await session.execute(stmt)).all()
+    return [(int(page_number), text) for page_number, text in rows]
+
+
 async def search_pages(
     session: AsyncSession,
     conversation_id: str,

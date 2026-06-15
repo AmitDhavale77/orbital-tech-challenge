@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import re
 
+import structlog
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.services import document as document_service
+
+logger = structlog.get_logger()
 
 
 class Citation(BaseModel):
@@ -83,6 +86,27 @@ def verify_quote(quote: str, page_text: str) -> bool:
     return needle in _normalize(page_text)
 
 
+def locate_quote(quote: str, pages: list[tuple[int, str]], preferred: int) -> int | None:
+    """Return the page number where `quote` appears, or None if it's nowhere.
+
+    Reading a whole document, the model often cites the right quote on the wrong
+    page. Rather than drop a genuinely-present quote, we accept it on whichever
+    page actually contains it — preferring the cited page when it matches, so a
+    quote that legitimately recurs stays anchored where the model put it.
+    """
+    needle = _normalize(quote)
+    if not needle:
+        return None
+    pages_by_text = [(n, _normalize(t)) for n, t in pages]
+    for page_number, text in pages_by_text:
+        if page_number == preferred and needle in text:
+            return preferred
+    for page_number, text in pages_by_text:
+        if needle in text:
+            return page_number
+    return None
+
+
 async def verify_and_renumber(
     db: AsyncSession,
     conversation_id: str,
@@ -91,34 +115,50 @@ async def verify_and_renumber(
 ) -> tuple[str, list[VerifiedCitation]]:
     """Verify each citation against its page and reconcile the answer's markers.
 
-    Keeps only citations whose quote is present on their cited page (an unknown
-    document/page or non-matching quote is dropped as hallucinated, ADR-0002),
-    enriches each survivor with on-PDF highlight rects (PyMuPDF `search_for`),
-    then rewrites the `[n]` markers in `markdown` so the surviving citations are
-    numbered contiguously and every rendered marker resolves — a marker whose
-    citation was dropped is removed rather than left dangling.
+    A citation is kept if its quote appears verbatim ANYWHERE in the cited
+    document; when the model attributed it to the wrong page (common when it reads
+    a whole document at once), the page is corrected to where the quote actually
+    is. Only a quote that is nowhere in the document (or an unknown document) is
+    dropped as hallucinated (ADR-0002). Survivors are enriched with on-PDF
+    highlight rects (PyMuPDF `search_for`), then the `[n]` markers in `markdown`
+    are rewritten so the surviving citations are numbered contiguously and every
+    rendered marker resolves — a dropped citation's marker is removed.
 
     Returns the rewritten markdown and the verified, renumbered citations.
     """
     paths = await document_service.get_document_paths(db, conversation_id)
+    pages_cache: dict[str, list[tuple[int, str]]] = {}
     verified: list[VerifiedCitation] = []
     old_to_new: dict[int, int] = {}
     for old_number, citation in enumerate(citations, start=1):
-        page_text = await document_service.get_page_text(
-            db, conversation_id, citation.document_id, citation.page
-        )
-        if page_text is None or not verify_quote(citation.quote, page_text):
+        pages = pages_cache.get(citation.document_id)
+        if pages is None:
+            pages = await document_service.get_document_pages(
+                db, conversation_id, citation.document_id
+            )
+            pages_cache[citation.document_id] = pages
+        page = locate_quote(citation.quote, pages, citation.page)
+        if page is None:
+            logger.warning(
+                "Dropped unverifiable citation",
+                document_id=citation.document_id,
+                page=citation.page,
+                reason="document not found" if not pages else "quote not in document",
+                quote=citation.quote[:160],
+            )
             continue
         rects: list[list[float]] = []
         page_width = page_height = None
         path = paths.get(citation.document_id)
         if path:
             rects, page_width, page_height = document_service.compute_quote_rects(
-                path, citation.page, citation.quote
+                path, page, citation.quote
             )
+        data = citation.model_dump()
+        data["page"] = page  # corrected to where the quote actually appears
         verified.append(
             VerifiedCitation(
-                **citation.model_dump(),
+                **data,
                 rects=rects,
                 page_width=page_width,
                 page_height=page_height,
