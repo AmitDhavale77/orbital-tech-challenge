@@ -83,9 +83,9 @@ async def test_answer_cites_across_multiple_documents(
     async def stream_function(messages: list[ModelMessage], info: AgentInfo):
         seen = _tool_returns(messages)
         if seen == 0:
-            yield {0: DeltaToolCall(name="read_page", json_args=json.dumps({"document_id": lease.id, "page": 1}))}
+            yield {0: DeltaToolCall(name="read_pages", json_args=json.dumps({"document_id": lease.id, "start_page": 1}))}
         elif seen == 1:
-            yield {0: DeltaToolCall(name="read_page", json_args=json.dumps({"document_id": deed.id, "page": 1}))}
+            yield {0: DeltaToolCall(name="read_pages", json_args=json.dumps({"document_id": deed.id, "start_page": 1}))}
         else:
             payload = {
                 "markdown": "Rent is GBP 1.75m[1], previously a peppercorn[2].",
@@ -108,3 +108,66 @@ async def test_answer_cites_across_multiple_documents(
     cited_docs = {c["document_id"] for c in message["citations"]}
     assert cited_docs == {lease.id, deed.id}
     assert len(message["citations"]) == 2
+
+
+async def test_bundle_refreshes_when_a_document_is_added_mid_conversation(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # A document uploaded mid-conversation must become visible on the next turn.
+    # The agent's instructions list the CURRENT bundle fresh every turn, so a
+    # replayed prior `list_documents` result (frozen at 1 doc) can't hide the new
+    # document.
+    conversation = Conversation()
+    db_session.add(conversation)
+    await db_session.flush()
+    lease = Document(
+        conversation_id=conversation.id,
+        filename="lease.pdf",
+        file_path="/tmp/lease.pdf",
+        page_count=1,
+    )
+    lease.pages = [Page(page_number=1, text="The rent is GBP 850,000 per annum.")]
+    db_session.add(lease)
+    await db_session.commit()
+
+    seen_instructions: list[str] = []
+
+    async def fn(messages: list[ModelMessage], info: AgentInfo):
+        seen_instructions.append(info.instructions or "")
+        yield {
+            0: DeltaToolCall(
+                name=info.output_tools[0].name,
+                json_args=json.dumps({"markdown": "ok", "citations": []}),
+            )
+        }
+
+    with qa_agent.override(model=FunctionModel(stream_function=fn)):
+        r1 = await client.post(
+            f"/api/conversations/{conversation.id}/messages",
+            json={"content": "hi"},
+        )
+    assert r1.status_code == 200
+    # Turn 1: only the lease exists, so only it is listed.
+    assert "lease.pdf" in seen_instructions[-1]
+    assert "environmental.pdf" not in seen_instructions[-1]
+
+    # Upload a second document AFTER the first turn (mid-conversation).
+    env = Document(
+        conversation_id=conversation.id,
+        filename="environmental.pdf",
+        file_path="/tmp/env.pdf",
+        page_count=1,
+    )
+    env.pages = [Page(page_number=1, text="Phase I environmental assessment.")]
+    db_session.add(env)
+    await db_session.commit()
+
+    with qa_agent.override(model=FunctionModel(stream_function=fn)):
+        r2 = await client.post(
+            f"/api/conversations/{conversation.id}/messages",
+            json={"content": "compare the dates of both documents"},
+        )
+    assert r2.status_code == 200
+    # Turn 2: the instructions reflect BOTH documents — fresh, not the stale view.
+    assert "lease.pdf" in seen_instructions[-1]
+    assert "environmental.pdf" in seen_instructions[-1]

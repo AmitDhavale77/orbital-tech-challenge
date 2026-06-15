@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import structlog
 from pydantic import BaseModel
@@ -45,10 +46,17 @@ class VerifiedCitation(Citation):
 
 
 class GroundedAnswer(BaseModel):
-    """The server-side result after verification: markdown + verified citations."""
+    """The server-side result after verification: markdown + verified citations.
+
+    `model_history` is the serialized PydanticAI `all_messages()` snapshot for the
+    run (`to_jsonable_python(...)`), carried back so the router can persist it for
+    replay/compaction. It is `None` on the degrade path so a failed turn never
+    overwrites the last good snapshot.
+    """
 
     markdown: str
     citations: list[VerifiedCitation]
+    model_history: list[dict[str, Any]] | None = None
 
 
 _WHITESPACE = re.compile(r"\s+")

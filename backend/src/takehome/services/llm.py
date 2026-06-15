@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import AsyncIterable, AsyncIterator, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -24,7 +25,12 @@ from pydantic_ai.messages import (
     ToolCallPart,
     UserPromptPart,
 )
-from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
+from pydantic_ai.models.anthropic import (
+    AnthropicCompaction,
+    AnthropicModel,
+    AnthropicModelSettings,
+)
+from pydantic_core import to_jsonable_python
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.services import (
@@ -50,43 +56,72 @@ CHAT_USAGE_LIMITS = UsageLimits(
 
 INSTRUCTIONS = (
     "You are a precise assistant for commercial real estate lawyers reviewing a "
-    "Document Bundle during due diligence.\n\n"
-    "You cannot see any document text until you read it. Tools:\n"
-    "- `list_documents()` — the bundle's `document_count`, its documents (each with "
-    "a routing `card`: type, parties, date, topics, one-line), and `guidance`. "
-    "Cards are hints only: never quote or cite a card.\n"
-    "- `read_document(document_id)` — a whole document's text, split by "
-    "`--- Page N ---` markers. Your primary tool for reading.\n"
-    "- `read_page(document_id, page)` — re-read a single page (e.g. to re-check a "
-    "quote).\n\n"
-    "First decide what the user is asking, then act:\n"
-    "- A question about the documents → call `list_documents()` ONCE, pick the "
-    "relevant documents from the cards, `read_document` each, then answer with "
-    "citations. Read every document that could bear on the answer (for "
-    "'compare across the bundle' / 'summarise everything', read them all).\n"
-    "- The bundle is empty (`document_count` is 0) → tell the user no documents "
-    "have been uploaded yet and that you can help once they upload some. Do not "
-    "call any more tools.\n"
-    "- The user names a document or detail not in the bundle → say it isn't in the "
-    "bundle, and mention what the bundle does contain.\n"
-    "- You read the relevant documents but the answer isn't there → say "
-    '"Not specified" (no citation) rather than speculating.\n'
-    "- A greeting or a question about what you can do → answer briefly and "
-    "directly; do not call tools and do not cite.\n"
-    "- A question NOT about this bundle (general law, outside knowledge, current "
-    "events) → politely decline: explain you only answer from the documents in "
-    "this bundle, and suggest a grounded next step (e.g. checking how a term is "
-    "used in a specific document). Do not answer from outside knowledge.\n\n"
+    "Document Bundle during due diligence. For any factual claim you rely ONLY on "
+    "the documents in this bundle — never on outside knowledge.\n\n"
+    "Classify each message into one of three types, then follow that branch. "
+    "Decide the type BEFORE calling any tool.\n\n"
+    "Type 1 — Conversational: a greeting, small talk, thanks, or a question about "
+    "you or what you can do. Reply briefly and naturally, with no tool calls and no "
+    "citations. This applies whether or not documents are uploaded; never tell "
+    "someone to upload documents in response to a greeting or a capability "
+    "question. You may add one sentence on what you do: answer questions grounded "
+    "in the documents in their bundle.\n\n"
+    "Type 2 — A question about the documents: call `list_documents()` once, then\n"
+    "   - if document_count is 0, the bundle is empty: tell the user no documents "
+    "have been uploaded yet and that you can help as soon as they add some, and "
+    "call no other tool;\n"
+    "   - otherwise locate the relevant pages with `grep`/`outline`, read and quote "
+    "them with `read_pages`, and check every document that could bear on the "
+    "answer;\n"
+    "   - if an earlier turn in this conversation already read the pages this "
+    "question needs and the bundle is unchanged, answer from that text already in "
+    "your context and reuse those citations — do NOT re-run "
+    "`list_documents`/`grep`/`read_pages` to re-read pages you have already read. "
+    "You must still emit a citation with a verbatim `quote` for every factual "
+    "claim (quotes are re-checked against the source each turn); only read again "
+    "for pages you have not yet seen;\n"
+    "   - if the user names a document or detail not in the bundle, say it isn't in "
+    "the bundle and mention what the bundle does contain;\n"
+    "   - if you read the relevant pages but the answer isn't there, say "
+    '"Not specified" (no citation) rather than speculating.\n\n'
+    "Type 3 — A question NOT about this bundle (general law, outside knowledge, "
+    "current events): politely decline, explain you only answer from the documents "
+    "in this bundle, and suggest a grounded next step (e.g. checking how a term is "
+    "used in a specific document). Do not answer from outside knowledge; do not "
+    "cite.\n\n"
+    "Classification examples:\n"
+    "- 'hi' / 'how are you?' → Type 1\n"
+    "- 'what can you do?' / 'how does this work?' → Type 1\n"
+    "- 'thanks, that's helpful' → Type 1\n"
+    "- 'what does the lease say about the rent review?' → Type 2\n"
+    "- 'is there a break clause?' / 'summarise the bundle' → Type 2\n"
+    "- 'is a break clause enforceable under English law?' → Type 3\n"
+    "- 'what's the latest case law on dilapidations?' → Type 3\n\n"
+    "Tools (you cannot see any document text until you read it):\n"
+    "- `list_documents()` — the bundle's document_count, its documents (each with a "
+    "routing `card`: type, parties, date, topics, one-line), and guidance. Cards "
+    "are hints only: never quote or cite a card.\n"
+    "- `grep(pattern, document_id?)` — case-insensitive regex search across the "
+    "bundle, or one document if document_id is given; returns matching lines with "
+    "their document and page. Page text can wrap mid-phrase, so use `\\s+`/`.*` "
+    "between the words of a phrase.\n"
+    "- `outline(document_id)` — a per-page map of one document, to decide which "
+    "pages to read.\n"
+    "- `read_pages(document_id, start_page, end_page?)` — read a page range "
+    "(`--- Page N ---` markers); this is the ONLY text you may quote and cite.\n\n"
     "Rules:\n"
-    "- Call `list_documents()` at most once; never call the same tool repeatedly "
-    "hoping for a different result.\n"
-    "- Base every statement on text you have actually read. Never guess or rely on "
-    "prior knowledge of the documents.\n"
-    "- Support each factual claim with a citation: the document, the page (from the "
-    "nearest `--- Page N ---` marker above the passage), and a `quote` copied "
-    "VERBATIM from that page's text (the quote is checked against the page, so it "
-    "must match exactly). Add `[1]`, `[2]` markers in the markdown matching the "
-    "citation order. Never invent a citation.\n"
+    "- The current bundle is listed in your instructions and is always up to date. "
+    "Call `list_documents()` when you need the cards; call it again only if that "
+    "list shows a document you have not yet seen a card for (e.g. one uploaded "
+    "mid-conversation). Otherwise never repeat a tool call hoping for a different "
+    "result.\n"
+    "- Base every factual statement on text you have actually read; never guess or "
+    "rely on prior knowledge of the documents.\n"
+    "- Cite each factual claim with the document, the page (from the nearest "
+    "`--- Page N ---` marker above the passage), and a `quote` copied VERBATIM "
+    "from that page (the quote is checked against the page, so it must match "
+    "exactly). Add `[1]`, `[2]` markers in the markdown in citation order; never "
+    "invent a citation.\n"
     "- Be concise and precise. Lawyers value accuracy over verbosity."
 )
 
@@ -115,12 +150,19 @@ _QA_SETTINGS = AnthropicModelSettings(
     anthropic_cache_tool_definitions=True,
 )
 
+# Anthropic server-side compaction: once a conversation's replayed history exceeds
+# the threshold, the model summarises older turns server-side and surfaces a
+# CompactionPart we round-trip via the persisted ModelMessage history (docs §7).
+# 150k sits ~2.6x below CHAT_USAGE_LIMITS' 400k hard cap, so compaction (graceful)
+# fires well before UsageLimitExceeded (degrade). Inert until a long, page-heavy
+# chat actually grows; needs a compaction-capable model (Sonnet 4.6 ✓, not Haiku).
 qa_agent = Agent(
     AnthropicModel(QA_MODEL),
     deps_type=AppDeps,
     output_type=Answer,  # structured output; str kept out of the union (forces it)
     instructions=INSTRUCTIONS,
     model_settings=_QA_SETTINGS,
+    capabilities=[AnthropicCompaction(token_threshold=150_000)],
     retries=2,
 )
 
@@ -131,6 +173,34 @@ def todays_date(ctx: RunContext[AppDeps]) -> str:
     return f"Today's date is {datetime.now(UTC):%d %B %Y}."
 
 
+@qa_agent.instructions
+async def current_bundle(ctx: RunContext[AppDeps]) -> str:
+    """Inject the CURRENT document bundle every turn.
+
+    Instructions are re-sent each turn and are NOT part of the replayed message
+    history, so this list is always live — even when a prior turn's
+    `list_documents()` result (frozen in the replayed history) is stale because a
+    document was added or removed since. This is what keeps a document uploaded
+    mid-conversation from being invisible.
+    """
+    docs = await document_service.list_documents_for_conversation(
+        ctx.deps.db, ctx.deps.conversation_id
+    )
+    if not docs:
+        return "The document bundle is currently EMPTY (0 documents)."
+    listing = "\n".join(
+        f"- {d.filename} (document_id: {d.id}, {d.page_count} pages)" for d in docs
+    )
+    return (
+        f"The bundle currently contains {len(docs)} document(s), as of right now:\n"
+        f"{listing}\n"
+        "This list is always current and authoritative. If it differs from a "
+        "`list_documents()` result earlier in the conversation, documents were "
+        "added or removed since — trust THIS list, and call `list_documents()` "
+        "again to get any new document's card."
+    )
+
+
 # Self-describing tool returns: the empty state must instruct the next action so
 # the agent stops instead of re-calling list_documents() until it hits the limit.
 _EMPTY_BUNDLE_GUIDANCE = (
@@ -138,7 +208,8 @@ _EMPTY_BUNDLE_GUIDANCE = (
     "nothing to analyse yet and to upload documents. Do not call any more tools."
 )
 _BUNDLE_GUIDANCE = (
-    "Pick the relevant documents from the cards, then call read_document on each."
+    "Pick the relevant documents from the cards, then use grep to find pages, "
+    "outline to see a document's pages, and read_pages to read and quote them."
 )
 
 
@@ -171,80 +242,95 @@ async def list_documents(ctx: RunContext[AppDeps]) -> dict[str, object]:
     return _documents_payload(document_service.document_summaries(docs))
 
 
-# NOTE: the keyword `search` tool is intentionally DISABLED, not deleted. In
-# practice `ts_rank` keyword routing surfaced the wrong documents (low ranking
-# precision), so routing now goes through the LLM-generated cards instead
-# (list_documents → read_document). The `search_pages` service + `pages.tsv`
-# index are kept so a future *reranked / hybrid* search can be re-enabled by
-# uncommenting this tool. See ADR-0002 and docs/research/architectures.md.
-#
-# @qa_agent.tool
-# async def search(ctx: RunContext[AppDeps], query: str) -> list[dict[str, str | int]]:
-#     """Find the most relevant pages across the bundle by keyword.
-#
-#     Returns page-level hits — `document_id`, `document_name`, `page`, and a
-#     `preview` (the keyword-in-context fragment) — diversified across documents so
-#     a long document can't crowd out a short one. The preview is only a hint for
-#     deciding what to open: call `read_page` on a hit to read the full page and
-#     quote it. Re-run with different keywords if nothing relevant comes back.
-#
-#     Args:
-#         query: keywords or a natural-language phrase (exact terms like dates,
-#             clause numbers, and defined terms work best).
-#     """
-#     return await document_service.search_pages(
-#         ctx.deps.db, ctx.deps.conversation_id, query
-#     )
-
-
 @qa_agent.tool
-async def read_document(ctx: RunContext[AppDeps], document_id: str) -> str:
-    """Return the FULL text of one document, with `--- Page N ---` markers.
+async def outline(
+    ctx: RunContext[AppDeps], document_id: str
+) -> list[dict[str, str | int]]:
+    """Show a per-page map of one document — its table of contents.
 
-    This is the primary way to read: it gives you every page of the document at
-    once, so you can answer breadth questions (summaries, "what does this lease
-    say about X") without many round-trips. The page markers keep citations
-    page-anchored — quote from a page and cite that page's number. Use
-    `read_page` only to re-read a single page you already know you need.
+    Returns each page with the start of its text, so you can see what's on each
+    page and decide which pages to read. Then call `read_pages` on the pages you
+    need.
 
     Args:
         document_id: id from list_documents().
     """
-    text = await document_service.get_document_text(
+    pages = await document_service.get_document_outline(
         ctx.deps.db, ctx.deps.conversation_id, document_id
     )
-    if text is None:
+    if pages is None:
         raise ModelRetry(
-            f"No document {document_id} found in this bundle (or it has no "
-            "readable text). Call list_documents() for valid document ids."
+            f"No document {document_id} in this bundle. "
+            "Call list_documents() for valid document ids."
         )
-    return text
+    return pages
 
 
 @qa_agent.tool
-async def read_page(ctx: RunContext[AppDeps], document_id: str, page: int) -> str:
-    """Return the full text of one page — the ONLY source you may quote.
+async def grep(
+    ctx: RunContext[AppDeps], pattern: str, document_id: str | None = None
+) -> list[dict[str, str | int]]:
+    r"""Search the bundle with a regular expression, like grep.
+
+    Returns every matching line with its `document_name`, `document_id`, and
+    `page`. Searches ALL documents unless you pass `document_id`. Page text can
+    wrap mid-phrase, so use `\s+` or `.*` between the words of a phrase. You choose
+    the pattern and how broad or specific to make it; an empty result means no
+    line matched — try a simpler or different pattern. Use grep to find which
+    pages to read, then `read_pages` to read and quote them.
+
+    Args:
+        pattern: a case-insensitive regular expression.
+        document_id: optional — restrict the search to a single document.
+    """
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise ModelRetry(
+            f"Invalid regular expression: {exc}. Fix the pattern and retry."
+        ) from exc
+    return await document_service.grep_pages(
+        ctx.deps.db, ctx.deps.conversation_id, pattern, document_id=document_id
+    )
+
+
+@qa_agent.tool
+async def read_pages(
+    ctx: RunContext[AppDeps],
+    document_id: str,
+    start_page: int,
+    end_page: int | None = None,
+) -> str:
+    """Read a range of pages — the text you quote and cite.
+
+    Returns pages `start_page`..`end_page` (inclusive) with `--- Page N ---`
+    markers, so quotes stay page-anchored: quote from a page and cite that page's
+    number. Omit `end_page` to read a single page.
 
     Args:
         document_id: id from list_documents().
-        page: 1-based page number.
+        start_page: 1-based first page.
+        end_page: 1-based last page (defaults to start_page).
     """
-    text = await document_service.get_page_text(
-        ctx.deps.db, ctx.deps.conversation_id, document_id, page
+    end = start_page if end_page is None else end_page
+    text = await document_service.get_pages_text(
+        ctx.deps.db, ctx.deps.conversation_id, document_id, start_page, end
     )
     if text is None:
         raise ModelRetry(
-            f"No page {page} found in document {document_id}. "
-            "Call list_documents() to see valid documents and their page counts."
+            f"No readable pages {start_page}-{end} in document {document_id}. "
+            "Call list_documents() / outline() to see valid documents and page counts."
         )
     return text
 
 
-def _to_model_history(history: Iterable[dict[str, str]]) -> list[ModelMessage]:
+def to_model_history(history: Iterable[dict[str, str]]) -> list[ModelMessage]:
     """Convert stored plain role/content messages into PydanticAI history.
 
-    Instructions are re-sent each turn by the agent, so history carries only the
-    prior turns (docs/pydantic-ai.md §6).
+    The back-compat seed for conversations predating the rich-history snapshot:
+    instructions are re-sent each turn by the agent, so history carries only the
+    prior turns' text (docs/pydantic-ai.md §6). Once a turn persists the full
+    `all_messages()` snapshot, that snapshot is replayed instead.
     """
     messages: list[ModelMessage] = []
     for entry in history:
@@ -265,27 +351,27 @@ def _tool_step(part: ToolCallPart, names: dict[str, str]) -> Step:
         args = part.args_as_dict()
     except Exception:
         args = {}
-    if part.tool_name == "search":
-        query = str(args.get("query", "")).strip()
-        label = f"Searching the bundle for “{query}”" if query else "Searching the bundle"
-        return Step(kind="search", label=label)
-    if part.tool_name == "read_document":
+    if part.tool_name == "grep":
+        pattern = str(args.get("pattern", "")).strip()
+        doc_id = str(args.get("document_id", "")) or None
+        where = names.get(doc_id or "", "the bundle") if doc_id else "the bundle"
+        label = f"Searching {where} for “{pattern}”" if pattern else f"Searching {where}"
+        return Step(kind="search", label=label, document_id=doc_id)
+    if part.tool_name == "outline":
         document_id = str(args.get("document_id", "")) or None
         name = names.get(document_id or "", "a document")
-        return Step(
-            kind="read",
-            label=f"Reading {name} (full document)",
-            document_id=document_id,
-        )
-    if part.tool_name == "read_page":
+        return Step(kind="list", label=f"Mapping {name}", document_id=document_id)
+    if part.tool_name == "read_pages":
         document_id = str(args.get("document_id", "")) or None
-        page = args.get("page")
+        start = args.get("start_page")
+        end = args.get("end_page", start)
         name = names.get(document_id or "", "a document")
+        span = f"p.{start}" if (end is None or end == start) else f"p.{start}-{end}"
         return Step(
             kind="read",
-            label=f"Reading {name} · p.{page}",
+            label=f"Reading {name} · {span}",
             document_id=document_id,
-            page=int(page) if isinstance(page, int) else None,
+            page=int(start) if isinstance(start, int) else None,
         )
     if part.tool_name == "list_documents":
         return Step(kind="list", label="Scanning the bundle")
@@ -296,14 +382,17 @@ async def answer_question(
     db: AsyncSession,
     conversation_id: str,
     question: str,
-    history: Iterable[dict[str, str]],
+    message_history: list[ModelMessage] | None = None,
 ) -> AsyncIterator[str | Step | GroundedAnswer]:
     """Stream the agent's answer over the conversation's bundle.
 
     Yields, in order of occurrence: `Step`s (the agent's tool actions, as they
-    happen), markdown deltas (`str`), and finally an `Answer` whose citations are
-    verified against their pages. The question is the only prompt content — the
-    agent reads pages on demand, so no document text is placed in the prompt.
+    happen), markdown deltas (`str`), and finally a `GroundedAnswer` whose
+    citations are verified against their pages and whose `model_history` is the
+    serialized full `all_messages()` snapshot for replay/compaction. The question
+    is the only new prompt content — the agent reads pages on demand, so no
+    document text is placed in the prompt; `message_history` carries prior turns
+    (including pages already read) so a repeat needn't re-read (docs §6).
     """
     deps = AppDeps(db=db, conversation_id=conversation_id)
     # Pre-fetch filenames so the event handler can label `read_page` steps without
@@ -327,7 +416,7 @@ async def answer_question(
             async with qa_agent.run_stream(
                 question,
                 deps=deps,
-                message_history=_to_model_history(history),
+                message_history=message_history,
                 usage_limits=CHAT_USAGE_LIMITS,
                 event_stream_handler=on_event,
             ) as result:
@@ -338,10 +427,20 @@ async def answer_question(
                         queue.put_nowait(markdown[len(streamed) :])
                         streamed = markdown
                 answer = await result.get_output()
+                # get_output() finalises the run, so all_messages() now includes
+                # this turn's tool calls/returns and the final structured response
+                # (the stream_text(delta=True) gotcha in §5 doesn't apply here).
+                serialized_history = to_jsonable_python(result.all_messages())
             markdown, verified = await verify_and_renumber(
                 db, conversation_id, answer.markdown, answer.citations
             )
-            queue.put_nowait(GroundedAnswer(markdown=markdown, citations=verified))
+            queue.put_nowait(
+                GroundedAnswer(
+                    markdown=markdown,
+                    citations=verified,
+                    model_history=serialized_history,
+                )
+            )
         except (UsageLimitExceeded, UnexpectedModelBehavior):
             # The agent hit its step budget (e.g. it kept looping). Degrade to a
             # graceful, source-free answer instead of surfacing a raw error.

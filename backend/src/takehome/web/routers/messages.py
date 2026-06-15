@@ -7,7 +7,9 @@ from datetime import datetime
 import structlog
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from pydantic_ai import ModelMessagesTypeAdapter
+from pydantic_ai.messages import ModelMessage
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
 
@@ -15,7 +17,12 @@ from takehome.db.models import Message
 from takehome.db.session import get_session
 from takehome.services.citations import GroundedAnswer, VerifiedCitation
 from takehome.services.conversation import get_conversation, update_conversation
-from takehome.services.llm import Step, answer_question, generate_title
+from takehome.services.llm import (
+    Step,
+    answer_question,
+    generate_title,
+    to_model_history,
+)
 
 logger = structlog.get_logger()
 
@@ -110,23 +117,36 @@ async def send_message(
 
     logger.info("User message saved", conversation_id=conversation_id, message_id=user_message.id)
 
-    # Load conversation history (exclude the message we just saved, it will be the user_message param)
-    stmt = (
-        select(Message)
+    # Resolve the agent-replay history. Prefer the rich ModelMessage snapshot
+    # (preserves prior tool calls/returns so a repeated question needn't re-read,
+    # and round-trips compaction); fall back to seeding from the plain-text
+    # `messages` table for conversations created before this feature (docs §6).
+    if conversation.model_history:
+        message_history: list[ModelMessage] = ModelMessagesTypeAdapter.validate_python(
+            conversation.model_history
+        )
+    else:
+        stmt = (
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .where(Message.id != user_message.id)
+            .order_by(Message.created_at.asc())
+        )
+        result = await session.execute(stmt)
+        message_history = to_model_history(
+            {"role": m.role, "content": m.content} for m in result.scalars().all()
+        )
+
+    # First user message? (drives title generation) — counted independently of the
+    # history branch above so it stays correct when replaying the rich snapshot.
+    count_stmt = (
+        select(func.count())
+        .select_from(Message)
         .where(Message.conversation_id == conversation_id)
         .where(Message.id != user_message.id)
-        .order_by(Message.created_at.asc())
+        .where(Message.role == "user")
     )
-    result = await session.execute(stmt)
-    history_messages = list(result.scalars().all())
-
-    conversation_history: list[dict[str, str]] = [
-        {"role": m.role, "content": m.content} for m in history_messages
-    ]
-
-    # Determine if this is the first user message (for title generation)
-    user_msg_count = sum(1 for m in history_messages if m.role == "user")
-    is_first_message = user_msg_count == 0
+    is_first_message = (await session.execute(count_stmt)).scalar_one() == 0
 
     async def event_stream() -> AsyncIterator[str]:
         """Generate SSE events with the streamed agent response.
@@ -148,7 +168,7 @@ async def send_message(
                     db=run_session,
                     conversation_id=conversation_id,
                     question=body.content,
-                    history=conversation_history,
+                    message_history=message_history,
                 ):
                     if isinstance(item, str):
                         full_response += item
@@ -186,6 +206,15 @@ async def send_message(
                 steps=steps_json,
             )
             run_session.add(assistant_message)
+
+            # Persist the full ModelMessage snapshot for replay/compaction, in the
+            # same transaction as the display message so the two can't diverge. The
+            # degrade path leaves model_history None — we keep the last good snapshot.
+            if final_answer is not None and final_answer.model_history is not None:
+                conv = await get_conversation(run_session, conversation_id)
+                if conv is not None:
+                    conv.model_history = final_answer.model_history
+
             await run_session.commit()
             await run_session.refresh(assistant_message)
 

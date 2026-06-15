@@ -31,8 +31,8 @@ async def test_agent_loop_degrades_gracefully_at_the_usage_limit(
     async def runaway(messages: list[ModelMessage], info: AgentInfo):
         yield {
             0: DeltaToolCall(
-                name="read_page",
-                json_args=json.dumps({"document_id": document.id, "page": 1}),
+                name="read_pages",
+                json_args=json.dumps({"document_id": document.id, "start_page": 1}),
             )
         }
 
@@ -43,7 +43,7 @@ async def test_agent_loop_degrades_gracefully_at_the_usage_limit(
                 db=db_session,
                 conversation_id=conversation.id,
                 question="loop forever",
-                history=[],
+                message_history=None,
             )
         ]
 

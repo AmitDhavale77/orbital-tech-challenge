@@ -15,7 +15,7 @@ from sqlalchemy import (
     Text,
     func,
 )
-from sqlalchemy.dialects.postgresql import TSVECTOR
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -33,6 +33,15 @@ class Conversation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
+    )
+    # Full PydanticAI ModelMessage history (to_jsonable_python(all_messages())),
+    # overwritten each turn. The agent replays this so it can reuse pages/quotes it
+    # already read instead of re-running its tools, and so Anthropic CompactionParts
+    # round-trip (ticket 08). The `messages` table stays the display source of truth;
+    # this is the agent-replay source of truth. Null until a conversation's first
+    # turn under this feature (back-compat: seed from plain text, then persist this).
+    model_history: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSONB, nullable=True
     )
 
     messages: Mapped[list[Message]] = relationship(

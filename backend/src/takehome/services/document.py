@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from typing import Any, cast
 
@@ -196,28 +197,6 @@ def compute_quote_rects(
     return rects, width, height
 
 
-async def get_page_text(
-    session: AsyncSession,
-    conversation_id: str,
-    document_id: str,
-    page_number: int,
-) -> str | None:
-    """Return the text of one page, scoped to the conversation.
-
-    Returns None when the document is not in this conversation or the page does
-    not exist — the agent's `read_page` tool turns that into a ModelRetry.
-    """
-    stmt = (
-        select(Page.text)
-        .join(Document, Page.document_id == Document.id)
-        .where(Document.conversation_id == conversation_id)
-        .where(Page.document_id == document_id)
-        .where(Page.page_number == page_number)
-    )
-    result = await session.execute(stmt)
-    return result.scalar_one_or_none()
-
-
 async def get_document_text(
     session: AsyncSession,
     conversation_id: str,
@@ -247,6 +226,91 @@ async def get_document_text(
         if text and text.strip()
     ]
     return "\n\n".join(parts) if parts else None
+
+
+async def get_pages_text(
+    session: AsyncSession,
+    conversation_id: str,
+    document_id: str,
+    start_page: int,
+    end_page: int,
+) -> str | None:
+    """Return the text of pages [start_page, end_page] joined with `--- Page N ---`
+    markers, scoped to the conversation. Blank pages are skipped, real page numbers
+    preserved (markers stay accurate). Returns None when the range has no readable
+    text — the agent's `read_pages` tool turns that into a ModelRetry.
+    """
+    lo, hi = (start_page, end_page) if start_page <= end_page else (end_page, start_page)
+    stmt = (
+        select(Page.page_number, Page.text)
+        .join(Document, Page.document_id == Document.id)
+        .where(Document.conversation_id == conversation_id)
+        .where(Page.document_id == document_id)
+        .where(Page.page_number >= lo)
+        .where(Page.page_number <= hi)
+        .order_by(Page.page_number.asc())
+    )
+    rows = (await session.execute(stmt)).all()
+    parts = [f"--- Page {n} ---\n{t}" for n, t in rows if t and t.strip()]
+    return "\n\n".join(parts) if parts else None
+
+
+async def grep_pages(
+    session: AsyncSession,
+    conversation_id: str,
+    pattern: str,
+    *,
+    document_id: str | None = None,
+) -> list[dict[str, str | int]]:
+    """Search the bundle with a regular expression, like grep.
+
+    Matches `pattern` (case-insensitive) against page text across the whole
+    conversation, or one document when `document_id` is given, and returns every
+    matching line with its document and page. No ranking, no caps — the agent
+    controls breadth via the pattern it writes.
+    """
+    stmt = (
+        select(Document.id, Document.filename, Page.page_number, Page.text)
+        .join(Document, Page.document_id == Document.id)
+        .where(Document.conversation_id == conversation_id)
+        .where(Page.text.op("~*")(pattern))  # case-insensitive POSIX regex
+        .order_by(Document.filename.asc(), Page.page_number.asc())
+    )
+    if document_id is not None:
+        stmt = stmt.where(Page.document_id == document_id)
+    rows = (await session.execute(stmt)).all()
+
+    regex = re.compile(pattern, re.IGNORECASE)
+    return [
+        {
+            "document_id": doc_id,
+            "document_name": filename,
+            "page": page_number,
+            "line": line.strip(),
+        }
+        for doc_id, filename, page_number, text in rows
+        for line in text.splitlines()
+        if regex.search(line)
+    ]
+
+
+async def get_document_outline(
+    session: AsyncSession,
+    conversation_id: str,
+    document_id: str,
+) -> list[dict[str, str | int]] | None:
+    """A per-page map of one document: `(page, head)` where `head` is the start of
+    the page's text. Lets the agent see what's on each page and decide what to read.
+    Returns None when the document is not in this conversation.
+    """
+    rows = await get_document_pages(session, conversation_id, document_id)
+    if not rows:
+        return None
+    return [
+        {"page": n, "head": " ".join(t.split())[:140]}
+        for n, t in rows
+        if t and t.strip()
+    ]
 
 
 async def get_document_pages(
