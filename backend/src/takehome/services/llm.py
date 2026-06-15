@@ -31,8 +31,10 @@ QA_MODEL = "claude-sonnet-4-6"
 TITLE_MODEL = "anthropic:claude-haiku-4-5-20251001"
 
 # Bounds the worst-case latency/cost of the agentic loop (docs/pydantic-ai.md §9).
-# Sized to read a small bundle page-by-page (each read_page is one request); the
-# keyword search tool (ticket 04) is what keeps this from growing with doc count.
+# Sized for card-routed reading: list_documents() then one read_document per
+# relevant doc (the whole doc in a single request). Breadth/aggregation across a
+# large 12–50-doc bundle is handled by the parallel fan-out batch path
+# (services/portfolio.py), not this sequential chat loop.
 CHAT_USAGE_LIMITS = UsageLimits(
     request_limit=20,
     tool_calls_limit=25,
@@ -46,22 +48,25 @@ INSTRUCTIONS = (
     "- `list_documents()` to see the documents in the bundle, each with a routing "
     "`card` (type, parties, date, topics, one-line). Cards are hints for choosing "
     "what to open — treat them as guidance only: never quote or cite a card, and "
-    "never conclude a fact is absent from a card alone; search/read to confirm.\n"
-    "- `search(query)` to find candidate pages across the bundle by keyword; it "
-    "returns a preview fragment per hit to help you choose.\n"
-    "- `read_page(document_id, page)` to read one page's full text on demand.\n\n"
-    "Workflow: for anything but the smallest bundle, `search(query)` first to find "
-    "candidate pages, then `read_page` the ones that look relevant to read the full "
-    "page and quote from it — never quote from a search preview alone. Re-run "
-    "`search` with different keywords if needed. For a tiny bundle you may read pages "
-    "directly. Read more pages if the answer is not yet clear.\n\n"
+    "never conclude a fact is absent from a card alone; read the document to confirm.\n"
+    "- `read_document(document_id)` to read a whole document at once. Its text is "
+    "split by `--- Page N ---` markers so you always know which page a passage is "
+    "on. This is your primary tool — prefer it for summaries and any question that "
+    "could span the document.\n"
+    "- `read_page(document_id, page)` to re-read a single page you already know you "
+    "need (e.g. to double-check an exact quote).\n\n"
+    "Workflow: call `list_documents()` first, then use the cards to choose which "
+    "documents are relevant and `read_document` each of them. Read every document "
+    "that could bear on the answer before concluding — for a 'compare across the "
+    "bundle' or 'summarise everything' question, that means reading them all.\n\n"
     "Rules:\n"
-    "- Base every statement on text you have actually read with `read_page`. "
-    "Never guess or rely on prior knowledge of the document.\n"
-    "- Support each factual claim with a citation: the document, the page, and a "
-    "`quote` copied VERBATIM from that page's text (the quote is checked against "
-    "the page, so it must match exactly). Add `[1]`, `[2]` markers in the markdown "
-    "matching the citation order.\n"
+    "- Base every statement on text you have actually read. Never guess or rely on "
+    "prior knowledge of the document.\n"
+    "- Support each factual claim with a citation: the document, the page (from the "
+    "nearest `--- Page N ---` marker above the passage), and a `quote` copied "
+    "VERBATIM from that page's text (the quote is checked against the page, so it "
+    "must match exactly). Add `[1]`, `[2]` markers in the markdown matching the "
+    "citation order.\n"
     "- If the bundle does not contain the answer, say \"Not specified\" with no "
     "citation rather than speculating.\n"
     "- Be concise and precise. Lawyers value accuracy over verbosity."
@@ -115,7 +120,7 @@ async def list_documents(ctx: RunContext[AppDeps]) -> list[dict[str, object]]:
     Call this first. Returns one entry per document with its `document_id`,
     `document_name`, `page_count`, and a `card` (a routing summary: type,
     parties, date/range, key topics, one-line). Use the cards to decide which
-    documents to `search`/`read_page` — they are hints only, never a source.
+    documents to `read_document` — they are hints only, never a source.
     """
     docs = await document_service.list_documents_for_conversation(
         ctx.deps.db, ctx.deps.conversation_id
@@ -123,23 +128,54 @@ async def list_documents(ctx: RunContext[AppDeps]) -> list[dict[str, object]]:
     return document_service.document_summaries(docs)
 
 
-@qa_agent.tool
-async def search(ctx: RunContext[AppDeps], query: str) -> list[dict[str, str | int]]:
-    """Find the most relevant pages across the bundle by keyword.
+# NOTE: the keyword `search` tool is intentionally DISABLED, not deleted. In
+# practice `ts_rank` keyword routing surfaced the wrong documents (low ranking
+# precision), so routing now goes through the LLM-generated cards instead
+# (list_documents → read_document). The `search_pages` service + `pages.tsv`
+# index are kept so a future *reranked / hybrid* search can be re-enabled by
+# uncommenting this tool. See ADR-0002 and docs/research/architectures.md.
+#
+# @qa_agent.tool
+# async def search(ctx: RunContext[AppDeps], query: str) -> list[dict[str, str | int]]:
+#     """Find the most relevant pages across the bundle by keyword.
+#
+#     Returns page-level hits — `document_id`, `document_name`, `page`, and a
+#     `preview` (the keyword-in-context fragment) — diversified across documents so
+#     a long document can't crowd out a short one. The preview is only a hint for
+#     deciding what to open: call `read_page` on a hit to read the full page and
+#     quote it. Re-run with different keywords if nothing relevant comes back.
+#
+#     Args:
+#         query: keywords or a natural-language phrase (exact terms like dates,
+#             clause numbers, and defined terms work best).
+#     """
+#     return await document_service.search_pages(
+#         ctx.deps.db, ctx.deps.conversation_id, query
+#     )
 
-    Returns page-level hits — `document_id`, `document_name`, `page`, and a
-    `preview` (the keyword-in-context fragment) — diversified across documents so
-    a long document can't crowd out a short one. The preview is only a hint for
-    deciding what to open: call `read_page` on a hit to read the full page and
-    quote it. Re-run with different keywords if nothing relevant comes back.
+
+@qa_agent.tool
+async def read_document(ctx: RunContext[AppDeps], document_id: str) -> str:
+    """Return the FULL text of one document, with `--- Page N ---` markers.
+
+    This is the primary way to read: it gives you every page of the document at
+    once, so you can answer breadth questions (summaries, "what does this lease
+    say about X") without many round-trips. The page markers keep citations
+    page-anchored — quote from a page and cite that page's number. Use
+    `read_page` only to re-read a single page you already know you need.
 
     Args:
-        query: keywords or a natural-language phrase (exact terms like dates,
-            clause numbers, and defined terms work best).
+        document_id: id from list_documents().
     """
-    return await document_service.search_pages(
-        ctx.deps.db, ctx.deps.conversation_id, query
+    text = await document_service.get_document_text(
+        ctx.deps.db, ctx.deps.conversation_id, document_id
     )
+    if text is None:
+        raise ModelRetry(
+            f"No document {document_id} found in this bundle (or it has no "
+            "readable text). Call list_documents() for valid document ids."
+        )
+    return text
 
 
 @qa_agent.tool
@@ -190,6 +226,14 @@ def _tool_step(part: ToolCallPart, names: dict[str, str]) -> Step:
         query = str(args.get("query", "")).strip()
         label = f"Searching the bundle for “{query}”" if query else "Searching the bundle"
         return Step(kind="search", label=label)
+    if part.tool_name == "read_document":
+        document_id = str(args.get("document_id", "")) or None
+        name = names.get(document_id or "", "a document")
+        return Step(
+            kind="read",
+            label=f"Reading {name} (full document)",
+            document_id=document_id,
+        )
     if part.tool_name == "read_page":
         document_id = str(args.get("document_id", "")) or None
         page = args.get("page")

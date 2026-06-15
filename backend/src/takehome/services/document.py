@@ -218,6 +218,37 @@ async def get_page_text(
     return result.scalar_one_or_none()
 
 
+async def get_document_text(
+    session: AsyncSession,
+    conversation_id: str,
+    document_id: str,
+) -> str | None:
+    """Return the full text of one document, scoped to the conversation.
+
+    Pages are joined with `--- Page N ---` markers (the same format as the ingest
+    blob) so the agent can read a whole document in a single call yet still cite
+    the exact page a passage came from. Blank pages are skipped but real page
+    numbers are preserved, so the markers stay accurate.
+
+    Returns None when the document is not in this conversation or has no readable
+    text — the agent's `read_document` tool turns that into a ModelRetry.
+    """
+    stmt = (
+        select(Page.page_number, Page.text)
+        .join(Document, Page.document_id == Document.id)
+        .where(Document.conversation_id == conversation_id)
+        .where(Page.document_id == document_id)
+        .order_by(Page.page_number.asc())
+    )
+    rows = (await session.execute(stmt)).all()
+    parts = [
+        f"--- Page {page_number} ---\n{text}"
+        for page_number, text in rows
+        if text and text.strip()
+    ]
+    return "\n\n".join(parts) if parts else None
+
+
 async def search_pages(
     session: AsyncSession,
     conversation_id: str,

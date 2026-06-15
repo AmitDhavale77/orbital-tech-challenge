@@ -1,32 +1,14 @@
 from __future__ import annotations
 
-import json
-from typing import Any
-
-from httpx import AsyncClient
-from pydantic_ai.messages import ModelMessage, ToolReturnPart
-from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.db.models import Conversation, Document, Page
 from takehome.services.document import search_pages
-from takehome.services.llm import qa_agent
 
-
-def _parse_sse(body: str) -> list[dict[str, Any]]:
-    return [
-        json.loads(line[len("data: ") :])
-        for line in body.splitlines()
-        if line.startswith("data: ")
-    ]
-
-
-def _tool_returns(messages: list[ModelMessage]) -> int:
-    return sum(
-        isinstance(part, ToolReturnPart)
-        for message in messages
-        for part in getattr(message, "parts", [])
-    )
+# NOTE: the keyword `search` *tool* is disabled (routing goes via cards →
+# read_document — see ADR-0002 / docs/research/architectures.md), but the
+# `search_pages` *service* and the `pages.tsv` index are kept so a future
+# reranked/hybrid search can be re-enabled. These tests guard that service.
 
 
 async def _seed_bundle(db: AsyncSession) -> tuple[str, str, str]:
@@ -88,86 +70,3 @@ async def test_search_is_scoped_to_the_conversation(db_session: AsyncSession) ->
 
     results = await search_pages(db_session, conversation_id, "rent")
     assert other_lease_id not in {r["document_id"] for r in results}
-
-
-async def test_agent_searches_then_reads(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
-    conversation_id, lease_id, _ = await _seed_bundle(db_session)
-    calls: list[str] = []
-
-    async def stream_function(messages: list[ModelMessage], info: AgentInfo):
-        seen = _tool_returns(messages)
-        if seen == 0:
-            calls.append("search")
-            yield {0: DeltaToolCall(name="search", json_args=json.dumps({"query": "rent"}))}
-        elif seen == 1:
-            calls.append("read_page")
-            yield {0: DeltaToolCall(name="read_page", json_args=json.dumps({"document_id": lease_id, "page": 1}))}
-        else:
-            payload = {
-                "markdown": "The lease discusses rent.[1]",
-                "citations": [
-                    {"document_id": lease_id, "document_name": "lease.pdf", "page": 1, "quote": "rent rent rent"}
-                ],
-            }
-            yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args=json.dumps(payload))}
-
-    with qa_agent.override(model=FunctionModel(stream_function=stream_function)):
-        response = await client.post(
-            f"/api/conversations/{conversation_id}/messages",
-            json={"content": "What does the lease say about rent?"},
-        )
-
-    assert response.status_code == 200
-    assert calls[:2] == ["search", "read_page"]  # search narrows, then read confirms
-    events = _parse_sse(response.text)
-    message = next(e["message"] for e in events if e.get("type") == "message")
-    assert message["citations"][0]["document_id"] == lease_id
-
-
-async def test_agent_steps_stream_live_and_persist(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
-    conversation_id, lease_id, _ = await _seed_bundle(db_session)
-
-    async def stream_function(messages: list[ModelMessage], info: AgentInfo):
-        seen = _tool_returns(messages)
-        if seen == 0:
-            yield {0: DeltaToolCall(name="search", json_args=json.dumps({"query": "annual rent"}))}
-        elif seen == 1:
-            yield {0: DeltaToolCall(name="read_page", json_args=json.dumps({"document_id": lease_id, "page": 1}))}
-        else:
-            payload = {
-                "markdown": "Rent.[1]",
-                "citations": [
-                    {"document_id": lease_id, "document_name": "lease.pdf", "page": 1, "quote": "rent rent rent"}
-                ],
-            }
-            yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args=json.dumps(payload))}
-
-    with qa_agent.override(model=FunctionModel(stream_function=stream_function)):
-        response = await client.post(
-            f"/api/conversations/{conversation_id}/messages",
-            json={"content": "What is the rent?"},
-        )
-
-    events = _parse_sse(response.text)
-
-    # Live: one step event per tool call, in order, with human labels, before the answer.
-    live_steps = [e for e in events if e.get("type") == "step"]
-    assert [s["kind"] for s in live_steps] == ["search", "read"]
-    assert "annual rent" in live_steps[0]["label"]
-    assert live_steps[1]["page"] == 1
-    assert live_steps[1]["document_id"] == lease_id
-    assert "lease.pdf" in live_steps[1]["label"]
-    types = [e.get("type") for e in events]
-    assert types.index("step") < types.index("message")
-
-    # Persisted: the final message carries the steps, and a reload returns them.
-    message = next(e["message"] for e in events if e.get("type") == "message")
-    assert [s["kind"] for s in message["steps"]] == ["search", "read"]
-
-    listed = await client.get(f"/api/conversations/{conversation_id}/messages")
-    assistant = next(m for m in listed.json() if m["role"] == "assistant")
-    assert [s["kind"] for s in assistant["steps"]] == ["search", "read"]
