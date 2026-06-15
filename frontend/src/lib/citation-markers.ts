@@ -1,5 +1,5 @@
 import { defaultRemarkPlugins } from "streamdown";
-import type { Pluggable, PluggableList } from "unified";
+import type { PluggableList } from "unified";
 
 /** Minimal mdast shape we touch — avoids depending on @types/mdast. */
 interface MdNode {
@@ -64,13 +64,31 @@ function transform(node: MdNode, count: number): void {
 	node.children = next;
 }
 
-function citationLinkPlugin(count: number): Pluggable {
-	return () => (tree: MdNode) => transform(tree, count);
+/** The remark attacher. `count` is taken via an options object (not closed over)
+ * and the function is named at module scope ON PURPOSE: streamdown memoizes the
+ * compiled remark pipeline in a module-level cache keyed by each plugin's
+ * function `name` + JSON-stringified options. An anonymous `() => (tree) => …`
+ * closure has an empty name and no options, so EVERY `count` collides on one
+ * cache entry — whichever `count` renders first is frozen for the rest of the
+ * session. (A conversation that opens with an uncited turn — a greeting,
+ * "Not specified", or an empty bundle — would seed `count = 0` and then render
+ * every later cited answer's `[n]` markers as plain text.) Naming it and moving
+ * `count` into options makes `citationLinkPlugin:{"count":2}` distinct from
+ * `:{"count":0}`, so the cache keys per count instead of colliding. */
+function citationLinkPlugin(options: { count: number }) {
+	return (tree: MdNode) => transform(tree, options.count);
 }
 
 /** Streamdown's GFM defaults plus an AST plugin that turns `[n]` markers into
  * `#cite-n` links. Passing `remarkPlugins` replaces streamdown's defaults, so we
- * merge them back in. */
-export function citationRemarkPlugins(count: number): PluggableList {
-	return [...Object.values(defaultRemarkPlugins), citationLinkPlugin(count)];
+ * merge them back in. `count` bounds which markers convert (markers beyond the
+ * verified citations stay literal); omit it — while streaming, citations aren't
+ * known yet — to convert every `[n]` to a (placeholder) marker. */
+export function citationRemarkPlugins(
+	count: number = Number.POSITIVE_INFINITY,
+): PluggableList {
+	return [
+		...Object.values(defaultRemarkPlugins),
+		[citationLinkPlugin, { count }],
+	];
 }
