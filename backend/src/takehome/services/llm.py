@@ -6,7 +6,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from pydantic import BaseModel
-from pydantic_ai import Agent, ModelRetry, RunContext, UsageLimits
+from pydantic_ai import (
+    Agent,
+    ModelRetry,
+    RunContext,
+    UnexpectedModelBehavior,
+    UsageLimitExceeded,
+    UsageLimits,
+)
 from pydantic_ai.messages import (
     AgentStreamEvent,
     FunctionToolCallEvent,
@@ -44,31 +51,42 @@ CHAT_USAGE_LIMITS = UsageLimits(
 INSTRUCTIONS = (
     "You are a precise assistant for commercial real estate lawyers reviewing a "
     "Document Bundle during due diligence.\n\n"
-    "You cannot see any document text until you read it. Use your tools:\n"
-    "- `list_documents()` to see the documents in the bundle, each with a routing "
-    "`card` (type, parties, date, topics, one-line). Cards are hints for choosing "
-    "what to open — treat them as guidance only: never quote or cite a card, and "
-    "never conclude a fact is absent from a card alone; read the document to confirm.\n"
-    "- `read_document(document_id)` to read a whole document at once. Its text is "
-    "split by `--- Page N ---` markers so you always know which page a passage is "
-    "on. This is your primary tool — prefer it for summaries and any question that "
-    "could span the document.\n"
-    "- `read_page(document_id, page)` to re-read a single page you already know you "
-    "need (e.g. to double-check an exact quote).\n\n"
-    "Workflow: call `list_documents()` first, then use the cards to choose which "
-    "documents are relevant and `read_document` each of them. Read every document "
-    "that could bear on the answer before concluding — for a 'compare across the "
-    "bundle' or 'summarise everything' question, that means reading them all.\n\n"
+    "You cannot see any document text until you read it. Tools:\n"
+    "- `list_documents()` — the bundle's `document_count`, its documents (each with "
+    "a routing `card`: type, parties, date, topics, one-line), and `guidance`. "
+    "Cards are hints only: never quote or cite a card.\n"
+    "- `read_document(document_id)` — a whole document's text, split by "
+    "`--- Page N ---` markers. Your primary tool for reading.\n"
+    "- `read_page(document_id, page)` — re-read a single page (e.g. to re-check a "
+    "quote).\n\n"
+    "First decide what the user is asking, then act:\n"
+    "- A question about the documents → call `list_documents()` ONCE, pick the "
+    "relevant documents from the cards, `read_document` each, then answer with "
+    "citations. Read every document that could bear on the answer (for "
+    "'compare across the bundle' / 'summarise everything', read them all).\n"
+    "- The bundle is empty (`document_count` is 0) → tell the user no documents "
+    "have been uploaded yet and that you can help once they upload some. Do not "
+    "call any more tools.\n"
+    "- The user names a document or detail not in the bundle → say it isn't in the "
+    "bundle, and mention what the bundle does contain.\n"
+    "- You read the relevant documents but the answer isn't there → say "
+    '"Not specified" (no citation) rather than speculating.\n'
+    "- A greeting or a question about what you can do → answer briefly and "
+    "directly; do not call tools and do not cite.\n"
+    "- A question NOT about this bundle (general law, outside knowledge, current "
+    "events) → politely decline: explain you only answer from the documents in "
+    "this bundle, and suggest a grounded next step (e.g. checking how a term is "
+    "used in a specific document). Do not answer from outside knowledge.\n\n"
     "Rules:\n"
+    "- Call `list_documents()` at most once; never call the same tool repeatedly "
+    "hoping for a different result.\n"
     "- Base every statement on text you have actually read. Never guess or rely on "
-    "prior knowledge of the document.\n"
+    "prior knowledge of the documents.\n"
     "- Support each factual claim with a citation: the document, the page (from the "
     "nearest `--- Page N ---` marker above the passage), and a `quote` copied "
     "VERBATIM from that page's text (the quote is checked against the page, so it "
     "must match exactly). Add `[1]`, `[2]` markers in the markdown matching the "
-    "citation order.\n"
-    "- If the bundle does not contain the answer, say \"Not specified\" with no "
-    "citation rather than speculating.\n"
+    "citation order. Never invent a citation.\n"
     "- Be concise and precise. Lawyers value accuracy over verbosity."
 )
 
@@ -113,19 +131,44 @@ def todays_date(ctx: RunContext[AppDeps]) -> str:
     return f"Today's date is {datetime.now(UTC):%d %B %Y}."
 
 
+# Self-describing tool returns: the empty state must instruct the next action so
+# the agent stops instead of re-calling list_documents() until it hits the limit.
+_EMPTY_BUNDLE_GUIDANCE = (
+    "The bundle is EMPTY — no documents have been uploaded. Tell the user there is "
+    "nothing to analyse yet and to upload documents. Do not call any more tools."
+)
+_BUNDLE_GUIDANCE = (
+    "Pick the relevant documents from the cards, then call read_document on each."
+)
+
+
+def _documents_payload(summaries: list[dict[str, object]]) -> dict[str, object]:
+    """Wrap document summaries in a self-describing envelope (count + guidance).
+
+    The agent reads `guidance` to decide what to do next — most importantly, the
+    empty-bundle case tells it to stop and inform the user rather than loop.
+    """
+    return {
+        "document_count": len(summaries),
+        "documents": summaries,
+        "guidance": _BUNDLE_GUIDANCE if summaries else _EMPTY_BUNDLE_GUIDANCE,
+    }
+
+
 @qa_agent.tool
-async def list_documents(ctx: RunContext[AppDeps]) -> list[dict[str, object]]:
+async def list_documents(ctx: RunContext[AppDeps]) -> dict[str, object]:
     """List the documents in this conversation's bundle.
 
-    Call this first. Returns one entry per document with its `document_id`,
-    `document_name`, `page_count`, and a `card` (a routing summary: type,
-    parties, date/range, key topics, one-line). Use the cards to decide which
-    documents to `read_document` — they are hints only, never a source.
+    Call this first (once). Returns `document_count`, the `documents` (each with
+    `document_id`, `document_name`, `page_count`, and a routing `card`: type,
+    parties, date/range, key topics, one-line), and `guidance` for what to do
+    next. If `document_count` is 0 the bundle is empty — tell the user and stop.
+    Cards are hints only, never a source.
     """
     docs = await document_service.list_documents_for_conversation(
         ctx.deps.db, ctx.deps.conversation_id
     )
-    return document_service.document_summaries(docs)
+    return _documents_payload(document_service.document_summaries(docs))
 
 
 # NOTE: the keyword `search` tool is intentionally DISABLED, not deleted. In
@@ -299,6 +342,15 @@ async def answer_question(
                 db, conversation_id, answer.markdown, answer.citations
             )
             queue.put_nowait(GroundedAnswer(markdown=markdown, citations=verified))
+        except (UsageLimitExceeded, UnexpectedModelBehavior):
+            # The agent hit its step budget (e.g. it kept looping). Degrade to a
+            # graceful, source-free answer instead of surfacing a raw error.
+            message = (
+                "I couldn't complete that within my step budget. Try a more "
+                "specific question, or ask about a particular document."
+            )
+            queue.put_nowait(message)
+            queue.put_nowait(GroundedAnswer(markdown=message, citations=[]))
         finally:
             queue.put_nowait(None)  # sentinel: run finished (success or error)
 

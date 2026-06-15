@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import json
 
-import pytest
-from pydantic_ai import UsageLimitExceeded
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.db.models import Conversation, Document, Page
+from takehome.services.citations import GroundedAnswer
 from takehome.services.llm import answer_question, qa_agent
 
 
-async def test_agent_loop_is_bounded_by_usage_limits(db_session: AsyncSession) -> None:
+async def test_agent_loop_degrades_gracefully_at_the_usage_limit(
+    db_session: AsyncSession,
+) -> None:
     conversation = Conversation()
     db_session.add(conversation)
     await db_session.flush()
@@ -36,11 +37,19 @@ async def test_agent_loop_is_bounded_by_usage_limits(db_session: AsyncSession) -
         }
 
     with qa_agent.override(model=FunctionModel(stream_function=runaway)):
-        with pytest.raises(UsageLimitExceeded):
-            async for _ in answer_question(
+        items = [
+            item
+            async for item in answer_question(
                 db=db_session,
                 conversation_id=conversation.id,
                 question="loop forever",
                 history=[],
-            ):
-                pass
+            )
+        ]
+
+    # The loop is still bounded by the usage limits, but instead of raising it now
+    # degrades to a graceful, source-free answer the user can act on.
+    finals = [i for i in items if isinstance(i, GroundedAnswer)]
+    assert finals, "expected a graceful final answer"
+    assert finals[-1].citations == []
+    assert finals[-1].markdown.strip()
