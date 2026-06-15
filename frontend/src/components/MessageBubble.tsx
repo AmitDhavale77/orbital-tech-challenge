@@ -10,6 +10,10 @@ import type { Citation, Message, Step } from "../types";
 import { AgentSteps } from "./AgentSteps";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
+/** Shared superscript-pill styling for a citation marker (clickable or placeholder). */
+const CITATION_CHIP_CLASS =
+	"mx-0.5 inline-flex items-center rounded bg-neutral-900 px-1 align-super text-[0.65rem] font-semibold leading-tight text-white no-underline";
+
 /** One inline, clickable reference marker rendered in place of a `[n]` token. */
 function CitationRef({
 	index,
@@ -27,7 +31,7 @@ function CitationRef({
 					type="button"
 					aria-label={`${citation.document_name} — page ${citation.page}`}
 					onClick={() => onCitationClick?.(citation)}
-					className="mx-0.5 inline-flex items-center rounded bg-neutral-900 px-1 align-super text-[0.65rem] font-semibold leading-tight text-white no-underline transition-colors hover:bg-neutral-700"
+					className={`${CITATION_CHIP_CLASS} transition-colors hover:bg-neutral-700`}
 				>
 					{index + 1}
 				</button>
@@ -167,6 +171,23 @@ export function MessageBubble({
 	);
 }
 
+/** While streaming, citations aren't known yet, so render `[n]` markers as
+ * non-clickable superscript placeholders (same look as the settled chip) instead
+ * of raw `[1]` text. They become clickable once the answer settles. */
+const streamingCitationComponents: Components = {
+	a: ({ href, children }) => {
+		const match = /^#cite-(\d+)$/.exec(href ?? "");
+		if (match) {
+			return <span className={CITATION_CHIP_CLASS}>{match[1]}</span>;
+		}
+		return (
+			<a href={href} target="_blank" rel="noreferrer">
+				{children}
+			</a>
+		);
+	},
+};
+
 interface StreamingBubbleProps {
 	content: string;
 	steps?: Step[];
@@ -189,7 +210,13 @@ export function StreamingBubble({
 				)}
 				{content ? (
 					<div className="prose">
-						<Streamdown mode="streaming">{content}</Streamdown>
+						<Streamdown
+							mode="streaming"
+							remarkPlugins={citationRemarkPlugins()}
+							components={streamingCitationComponents}
+						>
+							{content}
+						</Streamdown>
 						<span className="inline-block h-4 w-0.5 animate-pulse bg-neutral-400" />
 					</div>
 				) : steps.length === 0 ? (
