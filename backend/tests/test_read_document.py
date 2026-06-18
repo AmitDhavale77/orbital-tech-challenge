@@ -105,17 +105,12 @@ async def test_agent_reads_a_page_range_then_cites(
     calls: list[str] = []
 
     async def stream_function(messages: list[ModelMessage], info: AgentInfo):
-        if _tool_returns(messages) == 0:
+        seen = _tool_returns(messages)
+        if seen == 0:
             calls.append("read_pages")
             yield {0: DeltaToolCall(name="read_pages", json_args=json.dumps({"document_id": lease_id, "start_page": 1, "end_page": 2}))}
         else:
-            payload = {
-                "markdown": "The rent is GBP 1.75 million per annum.[1]",
-                "citations": [
-                    {"document_id": lease_id, "document_name": "lease.pdf", "page": 1, "quote": "The rent is GBP 1.75 million per annum."}
-                ],
-            }
-            yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args=json.dumps(payload))}
+            yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args=json.dumps({"markdown": "The rent is GBP 1.75 million per annum.[1]", "citations": [{"document_id": lease_id, "document_name": "lease.pdf", "page": 1, "quote": "The rent is GBP 1.75 million per annum."}]}))}
 
     with qa_agent.override(model=FunctionModel(stream_function=stream_function)):
         response = await client.post(
@@ -136,16 +131,11 @@ async def test_read_pages_step_streams_live_and_persists(
     conversation_id, lease_id = await _seed_doc(db_session)
 
     async def stream_function(messages: list[ModelMessage], info: AgentInfo):
-        if _tool_returns(messages) == 0:
+        seen = _tool_returns(messages)
+        if seen == 0:
             yield {0: DeltaToolCall(name="read_pages", json_args=json.dumps({"document_id": lease_id, "start_page": 1, "end_page": 3}))}
         else:
-            payload = {
-                "markdown": "Offices.[1]",
-                "citations": [
-                    {"document_id": lease_id, "document_name": "lease.pdf", "page": 2, "quote": "The Permitted Use is offices."}
-                ],
-            }
-            yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args=json.dumps(payload))}
+            yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args=json.dumps({"markdown": "Offices.[1]", "citations": [{"document_id": lease_id, "document_name": "lease.pdf", "page": 2, "quote": "The Permitted Use is offices."}]}))}
 
     with qa_agent.override(model=FunctionModel(stream_function=stream_function)):
         response = await client.post(

@@ -54,17 +54,10 @@ async def test_empty_bundle_lets_the_agent_decline_via_the_envelope(
             yield {0: DeltaToolCall(name="list_documents", json_args="{}")}
         else:
             seen["envelope"] = _last_tool_return(messages)
-            yield {
-                0: DeltaToolCall(
-                    name=info.output_tools[0].name,
-                    json_args=json.dumps(
-                        {
-                            "markdown": "No documents have been uploaded to this bundle yet. Please upload documents and ask again.",
-                            "citations": [],
-                        }
-                    ),
-                )
-            }
+            yield (
+                "No documents have been uploaded to this bundle yet. "
+                "Please upload documents and ask again."
+            )
 
     with qa_agent.override(model=FunctionModel(stream_function=stream_function)):
         response = await client.post(

@@ -18,7 +18,6 @@ text-bearing documents. Swap in `real-docs/` once OCR lands.
 
 from __future__ import annotations
 
-import io
 import json
 from typing import Any
 

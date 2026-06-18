@@ -26,7 +26,13 @@ class Citation(BaseModel):
 
 
 class Answer(BaseModel):
-    """The agent's typed output: answer markdown plus its citations."""
+    """A typed answer (markdown + citations) for the batch portfolio path.
+
+    The interactive chat agent streams native text and gathers citations via the
+    `cite` tool instead (Anthropic buffers tool-call JSON, so a structured output
+    can't stream token-by-token); this model is used by the non-streaming
+    map-reduce fan-out in `portfolio.py`.
+    """
 
     markdown: str
     citations: list[Citation]

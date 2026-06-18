@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import json
 from typing import Any
 
@@ -87,14 +86,20 @@ async def test_answer_cites_across_multiple_documents(
         elif seen == 1:
             yield {0: DeltaToolCall(name="read_pages", json_args=json.dumps({"document_id": deed.id, "start_page": 1}))}
         else:
-            payload = {
-                "markdown": "Rent is GBP 1.75m[1], previously a peppercorn[2].",
-                "citations": [
-                    {"document_id": lease.id, "document_name": "lease.pdf", "page": 1, "quote": "The rent is GBP 1.75 million"},
-                    {"document_id": deed.id, "document_name": "deed-of-variation.pdf", "page": 1, "quote": "varied to a peppercorn"},
-                ],
+            yield {
+                0: DeltaToolCall(
+                    name=info.output_tools[0].name,
+                    json_args=json.dumps(
+                        {
+                            "markdown": "Rent is GBP 1.75m[1], previously a peppercorn[2].",
+                            "citations": [
+                                {"document_id": lease.id, "document_name": "lease.pdf", "page": 1, "quote": "The rent is GBP 1.75 million"},
+                                {"document_id": deed.id, "document_name": "deed-of-variation.pdf", "page": 1, "quote": "varied to a peppercorn"},
+                            ],
+                        }
+                    ),
+                )
             }
-            yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args=json.dumps(payload))}
 
     with qa_agent.override(model=FunctionModel(stream_function=stream_function)):
         response = await client.post(

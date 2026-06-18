@@ -125,13 +125,17 @@ async def test_agent_greps_then_reads_then_cites(
             calls.append("read_pages")
             yield {0: DeltaToolCall(name="read_pages", json_args=json.dumps({"document_id": lease_id, "start_page": 1}))}
         else:
-            payload = {
-                "markdown": "The rent is GBP 850,000.[1]",
-                "citations": [
-                    {"document_id": lease_id, "document_name": "lease.pdf", "page": 1, "quote": "The Initial Rent is GBP 850,000 per annum."}
-                ],
+            yield {
+                0: DeltaToolCall(
+                    name=info.output_tools[0].name,
+                    json_args=json.dumps(
+                        {
+                            "markdown": "The rent is GBP 850,000.[1]",
+                            "citations": [{"document_id": lease_id, "document_name": "lease.pdf", "page": 1, "quote": "The Initial Rent is GBP 850,000 per annum."}],
+                        }
+                    ),
+                )
             }
-            yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args=json.dumps(payload))}
 
     with qa_agent.override(model=FunctionModel(stream_function=stream_function)):
         response = await client.post(

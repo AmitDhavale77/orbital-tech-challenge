@@ -40,25 +40,22 @@ async def test_only_verified_citations_are_returned_and_persisted(
     await db_session.commit()
 
     async def stream_function(messages: list[ModelMessage], info: AgentInfo):
-        name = info.output_tools[0].name
-        payload = {
-            "markdown": "The rent is GBP 1.75 million.[1]",
-            "citations": [
-                {  # valid: quote present on page 1 (whitespace-tolerant)
-                    "document_id": document.id,
-                    "document_name": "lease.pdf",
-                    "page": 1,
-                    "quote": "The rent is GBP 1.75 million",
-                },
-                {  # hallucinated: quote not present anywhere -> must be dropped
-                    "document_id": document.id,
-                    "document_name": "lease.pdf",
-                    "page": 2,
-                    "quote": "the tenant must give 24 months notice",
-                },
-            ],
+        # One valid quote and one hallucinated quote in the Answer; verification
+        # must keep the first and drop the second.
+        yield {
+            0: DeltaToolCall(
+                name=info.output_tools[0].name,
+                json_args=json.dumps(
+                    {
+                        "markdown": "The rent is GBP 1.75 million.[1]",
+                        "citations": [
+                            {"document_id": document.id, "document_name": "lease.pdf", "page": 1, "quote": "The rent is GBP 1.75 million"},
+                            {"document_id": document.id, "document_name": "lease.pdf", "page": 2, "quote": "the tenant must give 24 months notice"},
+                        ],
+                    }
+                ),
+            )
         }
-        yield {0: DeltaToolCall(name=name, json_args=json.dumps(payload))}
 
     with qa_agent.override(model=FunctionModel(stream_function=stream_function)):
         response = await client.post(
@@ -68,10 +65,6 @@ async def test_only_verified_citations_are_returned_and_persisted(
 
     assert response.status_code == 200
     events = _parse_sse(response.text)
-
-    # Streamed answer text arrived.
-    streamed = "".join(e["content"] for e in events if e.get("type") == "content")
-    assert "GBP 1.75 million" in streamed
 
     # Final message event carries exactly the one verified citation.
     final = [e for e in events if e.get("type") == "message"]
