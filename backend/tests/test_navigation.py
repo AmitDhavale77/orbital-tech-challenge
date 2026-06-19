@@ -9,7 +9,7 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.db.models import Conversation, Document, Page
-from takehome.services.document import get_document_outline, grep_pages
+from takehome.services.document import grep_pages
 from takehome.services.llm import qa_agent
 
 
@@ -88,23 +88,6 @@ async def test_grep_returns_empty_when_nothing_matches(
 ) -> None:
     conversation_id, _, _ = await _seed_bundle(db_session)
     assert await grep_pages(db_session, conversation_id, "nonexistent-term-xyz") == []
-
-
-# --- outline service --- #
-
-
-async def test_outline_maps_each_page(db_session: AsyncSession) -> None:
-    conversation_id, lease_id, _ = await _seed_bundle(db_session)
-    pages = await get_document_outline(db_session, conversation_id, lease_id)
-    assert pages is not None
-    assert [p["page"] for p in pages] == [1, 2]
-    assert str(pages[0]["head"]).startswith("The Initial Rent")
-
-
-async def test_outline_none_outside_the_conversation(db_session: AsyncSession) -> None:
-    conversation_id, lease_id, _ = await _seed_bundle(db_session)
-    other_id, _, _ = await _seed_bundle(db_session)
-    assert await get_document_outline(db_session, other_id, lease_id) is None
 
 
 # --- grep -> read_pages -> cite (HTTP seam) --- #

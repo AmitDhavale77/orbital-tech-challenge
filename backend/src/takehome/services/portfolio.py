@@ -154,14 +154,17 @@ async def _map_one(
             )
             for q in mapped.quotes
         ]
-        summary, verified = await verify_and_renumber(
-            session, conversation_id, mapped.summary, citations
-        )
+        # Verify/relocate the quotes only — pass empty markdown so the summary's
+        # prose is NOT run through citation-marker rewriting, which would delete or
+        # renumber any incidental bracketed number in it (e.g. a year "[2024]" or a
+        # schedule reference "[4]"). The map summary carries no [n] markers of its
+        # own; only a genuine answer body should ever have its markers rewritten.
+        _, verified = await verify_and_renumber(session, conversation_id, "", citations)
         return DocFinding(
             document_id=document_id,
             document_name=document_name,
             relevant=True,
-            summary=summary,
+            summary=mapped.summary,
             citations=verified,
         )
 
@@ -183,6 +186,50 @@ async def _reduce(
         )
 
 
+async def _gather_maps(
+    conversation_id: str,
+    question: str,
+    meta: list[tuple[str, str]],
+    concurrency: int,
+) -> list[DocFinding]:
+    """Run `_map_one` over (document_id, document_name) pairs in parallel, capped
+    by a semaphore so a large bundle doesn't open one LLM request (and session)
+    per document at once."""
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def guarded(document_id: str, document_name: str) -> DocFinding:
+        async with semaphore:
+            return await _map_one(conversation_id, document_id, document_name, question)
+
+    return list(await asyncio.gather(*(guarded(d, n) for d, n in meta)))
+
+
+async def map_documents(
+    conversation_id: str,
+    question: str,
+    document_ids: list[str],
+    *,
+    concurrency: int = MAP_CONCURRENCY,
+) -> list[DocFinding]:
+    """Map the named documents in PARALLEL → one finding each, no reduce.
+
+    The breadth path for the interactive chat loop (the `summarize_documents`
+    tool): each requested document is read and summarised in its own isolated
+    subagent context (Haiku), returning a summary plus verbatim, page-verified
+    quotes. The chat agent itself is the reduce — it synthesises and cites these
+    findings — so this stops at the map. Ids not in the bundle are skipped.
+    """
+    from takehome.db.session import async_session
+
+    async with async_session() as session:
+        documents = await document_service.list_documents_for_conversation(
+            session, conversation_id
+        )
+    wanted = set(document_ids)
+    meta = [(d.id, d.filename) for d in documents if d.id in wanted]
+    return await _gather_maps(conversation_id, question, meta, concurrency)
+
+
 async def analyze_portfolio(
     conversation_id: str, question: str, *, concurrency: int = MAP_CONCURRENCY
 ) -> PortfolioAnswer:
@@ -195,14 +242,7 @@ async def analyze_portfolio(
             session, conversation_id
         )
     meta = [(d.id, d.filename) for d in documents]
-
-    semaphore = asyncio.Semaphore(concurrency)
-
-    async def guarded(document_id: str, document_name: str) -> DocFinding:
-        async with semaphore:
-            return await _map_one(conversation_id, document_id, document_name, question)
-
-    findings = list(await asyncio.gather(*(guarded(d, n) for d, n in meta)))
+    findings = await _gather_maps(conversation_id, question, meta, concurrency)
     relevant = [f for f in findings if f.relevant]
     if not relevant:
         return PortfolioAnswer(

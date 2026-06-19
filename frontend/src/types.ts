@@ -18,7 +18,7 @@ export interface Citation {
 }
 
 export interface Step {
-	kind: "search" | "read" | "list" | "tool";
+	kind: "search" | "read" | "list" | "summarize" | "tool";
 	label: string;
 	document_id: string | null;
 	page: number | null;

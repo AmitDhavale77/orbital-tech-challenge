@@ -294,25 +294,6 @@ async def grep_pages(
     ]
 
 
-async def get_document_outline(
-    session: AsyncSession,
-    conversation_id: str,
-    document_id: str,
-) -> list[dict[str, str | int]] | None:
-    """A per-page map of one document: `(page, head)` where `head` is the start of
-    the page's text. Lets the agent see what's on each page and decide what to read.
-    Returns None when the document is not in this conversation.
-    """
-    rows = await get_document_pages(session, conversation_id, document_id)
-    if not rows:
-        return None
-    return [
-        {"page": n, "head": " ".join(t.split())[:140]}
-        for n, t in rows
-        if t and t.strip()
-    ]
-
-
 async def get_document_pages(
     session: AsyncSession,
     conversation_id: str,

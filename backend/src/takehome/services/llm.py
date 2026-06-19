@@ -5,6 +5,7 @@ import re
 from collections.abc import AsyncIterable, AsyncIterator, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import cast
 
 from pydantic import BaseModel
 from pydantic_ai import (
@@ -36,6 +37,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from takehome.services import (
     document as document_service,  # imports config → exports ANTHROPIC_API_KEY
 )
+from takehome.services import (
+    portfolio,
+)
 from takehome.services.citations import Answer, GroundedAnswer, verify_and_renumber
 
 # Capable model for the reasoning/tool loop; Haiku is reserved for cheap aux
@@ -50,8 +54,6 @@ TITLE_MODEL = "anthropic:claude-haiku-4-5-20251001"
 # large 12–50-doc bundle is handled by the parallel fan-out batch path
 # (services/portfolio.py), not this sequential chat loop.
 CHAT_USAGE_LIMITS = UsageLimits(
-    request_limit=40,
-    tool_calls_limit=50,
     total_tokens_limit=400_000,
 )
 
@@ -98,8 +100,10 @@ a plausible question with typos or shorthand, interpret it charitably and procee
 help as soon as they add some. Call no other tool.
 3. Otherwise use the cards only as routing hints (never quote or cite them) to decide which \
 documents could bear on the question. Check EVERY document that plausibly could — not just the \
-first match.
-4. Locate pages with `grep` and/or `outline`. Page text can wrap mid-phrase, so put `\\s+` or \
+first match. Then:
+   - Targeted — a specific fact, term, clause, date, or party in a small, known set of documents (roughly 1–3) → grep + read_pages (steps 4–5).
+   - Breadth — the answer needs whole-document summaries, or compares/aggregates across more than a handful of documents (e.g. "summarise the bundle", "across all the leases, which grant parking?") → call `summarize_documents(question, document_ids)` with the relevant ids, then answer from its returned summaries and quotes (skip steps 4–5).
+4. Locate pages with `grep`. Page text can wrap mid-phrase, so put `\\s+` or \
 `.*` between the words of a phrase rather than a literal space.
 5. Read located pages with `read_pages`. This returned text is the ONLY text you may quote and cite.
 6. Write your answer, with a citation for each supporting quote (see Citations), handling these cases:
@@ -110,19 +114,20 @@ bundle does contain.
 name them and ask which; never silently pick one.
    - Documents conflict → present each position with its own citation; do not resolve by assumption.
 
-Reusing prior reading: if an earlier turn already read the exact pages this question needs and \
-the bundle is unchanged, answer from text already in your context — do NOT re-run \
-`list_documents`/`grep`/`read_pages` for pages already read. You must still include a citation for \
-every factual claim (quotes are re-checked each turn). Only read again for pages you have not yet seen.
+Reusing prior reading: if an earlier turn already read the exact pages (or already summarised the \
+documents) this question needs and the bundle is unchanged, answer from text already in your context \
+— do NOT re-run `list_documents`/`grep`/`read_pages`/`summarize_documents` for pages already read or \
+documents already summarised. You must still include a citation for every factual claim (quotes are \
+re-checked each turn). Only read or summarise again for pages or documents you have not yet seen.
 
 # Tools (you cannot see any document text until you read it)
 - `list_documents()` — document_count, the documents (each with a routing card: type, parties, \
 date, topics, one-line) and guidance. Cards are hints only.
 - `grep(pattern, document_id?)` — case-insensitive regex across the bundle, or one document; \
 returns matching lines with document and page.
-- `outline(document_id)` — per-page map of one document.
 - `read_pages(document_id, start_page, end_page?)` — read a page range (`--- Page N ---` \
 markers). The only quotable, citable text.
+- `summarize_documents(question, document_ids)` — breadth path: reads and summarises several whole documents at once, each in its own context and in parallel, returning a per-document `summary` plus verbatim `quotes`. Use for questions spanning many documents; cite by copying a returned `quote` verbatim. For a specific fact on known pages, prefer `grep` + `read_pages`.
 
 # Tool hygiene
 - Types 1, 3, and Unclear call no tools.
@@ -135,6 +140,10 @@ one uploaded mid-conversation).
 `{document_id, page, quote}`, where `quote` is copied VERBATIM from a page you read (`page` is the \
 nearest `--- Page N ---` marker above the passage). Quotes are re-checked against the source, so \
 they must match character-for-character.
+- On the breadth path you did not read the page yourself: the citable text is a `quote` returned by \
+`summarize_documents` — copy it with the SAME quote object's `document_id`, `document_name`, and \
+`page`. Everything else about citations is identical; below, "re-read" means re-run \
+`summarize_documents`.
 - Mark each citation inline at the claim it supports with a marker that is EXACTLY `[n]` — a number \
 in square brackets and nothing else (write `[6]`, never `[6 (clause 7.3.1)]`; put any clause \
 reference in the prose, outside the brackets). Number them in the order of your `citations` list, \
@@ -156,7 +165,7 @@ never manufacture confidence the documents do not support.
 class Step(BaseModel):
     """One action the agent took to reach its answer (a streamed/persisted trace)."""
 
-    kind: str  # "search" | "read" | "list" | "tool"
+    kind: str  # "search" | "read" | "list" | "summarize" | "tool"
     label: str  # human-readable, e.g. 'Reading lease.pdf · p.4'
     document_id: str | None = None
     page: int | None = None
@@ -241,7 +250,16 @@ _EMPTY_BUNDLE_GUIDANCE = (
 )
 _BUNDLE_GUIDANCE = (
     "Pick the relevant documents from the cards, then use grep to find pages, "
-    "outline to see a document's pages, and read_pages to read and quote them."
+    "and read_pages to read and quote them."
+)
+_SUMMARIZE_GUIDANCE = (
+    "Write your answer from these summaries. Cite a claim by copying a `quote` "
+    "object's `document_id`, `document_name`, `page`, and `quote` together, VERBATIM "
+    "(character-for-character) — always take the document_id from the SAME quote "
+    "object you copied the text from, never from a different document. Quotes are "
+    "re-verified against the page, so a re-typed quote is dropped. Use a markdown "
+    "table when comparing documents. Ignore documents with relevant=false; if none "
+    "are relevant, say so."
 )
 
 
@@ -272,30 +290,6 @@ async def list_documents(ctx: RunContext[AppDeps]) -> dict[str, object]:
         ctx.deps.db, ctx.deps.conversation_id
     )
     return _documents_payload(document_service.document_summaries(docs))
-
-
-@qa_agent.tool
-async def outline(
-    ctx: RunContext[AppDeps], document_id: str
-) -> list[dict[str, str | int]]:
-    """Show a per-page map of one document — its table of contents.
-
-    Returns each page with the start of its text, so you can see what's on each
-    page and decide which pages to read. Then call `read_pages` on the pages you
-    need.
-
-    Args:
-        document_id: id from list_documents().
-    """
-    pages = await document_service.get_document_outline(
-        ctx.deps.db, ctx.deps.conversation_id, document_id
-    )
-    if pages is None:
-        raise ModelRetry(
-            f"No document {document_id} in this bundle. "
-            "Call list_documents() for valid document ids."
-        )
-    return pages
 
 
 @qa_agent.tool
@@ -351,9 +345,64 @@ async def read_pages(
     if text is None:
         raise ModelRetry(
             f"No readable pages {start_page}-{end} in document {document_id}. "
-            "Call list_documents() / outline() to see valid documents and page counts."
+            "Call list_documents() to see valid documents and page counts."
         )
     return text
+
+
+@qa_agent.tool
+async def summarize_documents(
+    ctx: RunContext[AppDeps], question: str, document_ids: list[str]
+) -> dict[str, object]:
+    """Summarise several whole documents at once — the breadth path.
+
+    Use this ONLY when the question is inherently about many documents together
+    (e.g. "summarise the bundle", "across all the leases, which grant parking?").
+    For a specific fact on known pages, use `grep` + `read_pages` instead.
+
+    Each named document is read and summarised in ITS OWN context, in parallel,
+    returning a `summary` plus `quotes` copied verbatim from its pages. Write your
+    answer from the returned summaries and cite by copying a `quote` exactly — the
+    quote is re-verified against the page, so a re-typed quote is dropped.
+
+    Args:
+        question: what to summarise each document against (usually the user's question).
+        document_ids: ids (from list_documents) of the documents to summarise.
+    """
+    docs = await document_service.list_documents_for_conversation(
+        ctx.deps.db, ctx.deps.conversation_id
+    )
+    valid = {d.id for d in docs}
+    chosen = [doc_id for doc_id in document_ids if doc_id in valid]
+    if not chosen:
+        raise ModelRetry(
+            "No valid document_ids given. Pass the ids (from list_documents()) of "
+            "the documents you want summarised."
+        )
+    findings = await portfolio.map_documents(
+        ctx.deps.conversation_id, question, chosen
+    )
+    return {
+        "findings": [
+            {
+                "document_id": f.document_id,
+                "document_name": f.document_name,
+                "relevant": f.relevant,
+                "summary": f.summary,
+                "quotes": [
+                    {
+                        "document_id": c.document_id,
+                        "document_name": c.document_name,
+                        "page": c.page,
+                        "quote": c.quote,
+                    }
+                    for c in f.citations
+                ],
+            }
+            for f in findings
+        ],
+        "guidance": _SUMMARIZE_GUIDANCE,
+    }
 
 
 def to_model_history(history: Iterable[dict[str, str]]) -> list[ModelMessage]:
@@ -389,10 +438,6 @@ def _tool_step(part: ToolCallPart, names: dict[str, str]) -> Step:
         where = names.get(doc_id or "", "the bundle") if doc_id else "the bundle"
         label = f"Searching {where} for “{pattern}”" if pattern else f"Searching {where}"
         return Step(kind="search", label=label, document_id=doc_id)
-    if part.tool_name == "outline":
-        document_id = str(args.get("document_id", "")) or None
-        name = names.get(document_id or "", "a document")
-        return Step(kind="list", label=f"Mapping {name}", document_id=document_id)
     if part.tool_name == "read_pages":
         document_id = str(args.get("document_id", "")) or None
         start = args.get("start_page")
@@ -405,6 +450,10 @@ def _tool_step(part: ToolCallPart, names: dict[str, str]) -> Step:
             document_id=document_id,
             page=int(start) if isinstance(start, int) else None,
         )
+    if part.tool_name == "summarize_documents":
+        ids = args.get("document_ids")
+        count = len(cast("list[object]", ids)) if isinstance(ids, list) else 0
+        return Step(kind="summarize", label=f"Summarising {count} document(s)")
     if part.tool_name == "list_documents":
         return Step(kind="list", label="Scanning the bundle")
     return Step(kind="tool", label=f"Running {part.tool_name}")

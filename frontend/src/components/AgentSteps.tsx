@@ -1,5 +1,6 @@
 import { AnimatePresence, motion } from "framer-motion";
 import {
+	BookOpen,
 	ChevronRight,
 	FileText,
 	Layers,
@@ -14,6 +15,7 @@ function StepIcon({ kind }: { kind: Step["kind"] }) {
 	const className = "h-3 w-3 flex-shrink-0 text-neutral-400";
 	if (kind === "search") return <Search className={className} />;
 	if (kind === "read") return <FileText className={className} />;
+	if (kind === "summarize") return <BookOpen className={className} />;
 	if (kind === "list") return <Layers className={className} />;
 	return <Wrench className={className} />;
 }
@@ -55,10 +57,15 @@ function StepRow({
 function summarize(steps: Step[]): string {
 	const searches = steps.filter((s) => s.kind === "search").length;
 	const reads = steps.filter((s) => s.kind === "read").length;
+	const summarized = steps.filter((s) => s.kind === "summarize").length;
 	const parts: string[] = [];
 	if (searches)
 		parts.push(searches === 1 ? "Searched the bundle" : `${searches} searches`);
 	if (reads) parts.push(`read ${reads} page${reads === 1 ? "" : "s"}`);
+	if (summarized)
+		parts.push(
+			`summarised ${summarized} document${summarized === 1 ? "" : "s"}`,
+		);
 	return (
 		parts.join(" · ") || `${steps.length} step${steps.length === 1 ? "" : "s"}`
 	);
