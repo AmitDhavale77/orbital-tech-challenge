@@ -88,9 +88,12 @@ class Document(Base):
     )
     filename: Mapped[str] = mapped_column(String)
     file_path: Mapped[str] = mapped_column(String)
+    # sha256 of the uploaded bytes — dedup key within a conversation's bundle
+    # (the same PDF cannot be uploaded twice). Nullable for pre-dedup rows.
+    content_hash: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     extracted_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     page_count: Mapped[int] = mapped_column(Integer, default=0)
-    # Routing card as JSON: {type, parties[], date_or_range, key_topics[], one_line}.
+    # Routing card as JSON: {kind, summary}.
     # A hint for the agent only — never a citable Source (ADR-0002).
     card: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

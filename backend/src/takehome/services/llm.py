@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterable, AsyncIterator, Iterable
+from collections.abc import AsyncIterable, AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
@@ -20,11 +20,7 @@ from pydantic_ai.messages import (
     AgentStreamEvent,
     FunctionToolCallEvent,
     ModelMessage,
-    ModelRequest,
-    ModelResponse,
-    TextPart,
     ToolCallPart,
-    UserPromptPart,
 )
 from pydantic_ai.models.anthropic import (
     AnthropicCompaction,
@@ -34,6 +30,7 @@ from pydantic_ai.models.anthropic import (
 from pydantic_core import to_jsonable_python
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from takehome.config import settings
 from takehome.services import (
     document as document_service,  # imports config → exports ANTHROPIC_API_KEY
 )
@@ -42,19 +39,15 @@ from takehome.services import (
 )
 from takehome.services.citations import Answer, GroundedAnswer, verify_and_renumber
 
-# Capable model for the reasoning/tool loop; Haiku is reserved for cheap aux
-# calls (conversation titles). See CLAUDE.md and docs/pydantic-ai.md.
-QA_MODEL = "claude-sonnet-4-6"
-TITLE_MODEL = "anthropic:claude-haiku-4-5-20251001"
-
 # Bounds the worst-case latency/cost of the agentic loop (docs/pydantic-ai.md §9).
 # Navigation (grep/read_pages) means a thorough question makes many small tool
 # calls before it can answer, so the loop is sized generously; server-side
-# compaction (150k) keeps a long loop within the context window. Breadth across a
-# large 12–50-doc bundle is handled by the parallel fan-out batch path
-# (services/portfolio.py), not this sequential chat loop.
+# compaction keeps a long loop within the context window. Breadth across a large
+# 12–50-doc bundle is handled by the parallel fan-out batch path
+# (services/portfolio.py), not this sequential chat loop. All knobs live in
+# config.py.
 CHAT_USAGE_LIMITS = UsageLimits(
-    total_tokens_limit=400_000,
+    total_tokens_limit=settings.chat_total_tokens_limit,
 )
 
 INSTRUCTIONS = (
@@ -79,7 +72,8 @@ Pick the single governing type.
 
 Type 1 — Conversational: greeting, small talk, thanks, or a question about you or your \
 capabilities. Reply briefly and naturally. No tools, no citations. Never tell the user to \
-upload documents in response to a greeting or capability question. You may add one sentence: \
+upload documents in response to a greeting or capability question (unless the bundle is empty — \
+then you may briefly note they can upload PDFs to begin). You may add one sentence: \
 you answer questions grounded in the documents in their bundle.
 
 Type 2 — About the bundle: any question answerable from the documents (a specific term, party, \
@@ -121,8 +115,8 @@ documents already summarised. You must still include a citation for every factua
 re-checked each turn). Only read or summarise again for pages or documents you have not yet seen.
 
 # Tools (you cannot see any document text until you read it)
-- `list_documents()` — document_count, the documents (each with a routing card: type, parties, \
-date, topics, one-line) and guidance. Cards are hints only.
+- `list_documents()` — document_count, the documents (each with a routing card: kind, \
+summary) and guidance. Cards are hints only.
 - `grep(pattern, document_id?)` — case-insensitive regex across the bundle, or one document; \
 returns matching lines with document and page.
 - `read_pages(document_id, start_page, end_page?)` — read a page range (`--- Page N ---` \
@@ -177,11 +171,14 @@ class AppDeps:
 
     db: AsyncSession
     conversation_id: str
+    # Side-channel for a tool to push live Steps onto the run's SSE queue (used by
+    # summarize_documents to stream per-document progress). None outside a stream.
+    step_sink: Callable[[Step], None] | None = None
 
 
 # Cache only the stable prefix — system prompt + tool definitions — never a
 # preloaded document (docs/pydantic-ai.md §8, CLAUDE.md context-management rule).
-_QA_SETTINGS = AnthropicModelSettings(
+QA_SETTINGS = AnthropicModelSettings(
     anthropic_cache_instructions=True,
     anthropic_cache_tool_definitions=True,
 )
@@ -189,11 +186,11 @@ _QA_SETTINGS = AnthropicModelSettings(
 # Anthropic server-side compaction: once a conversation's replayed history exceeds
 # the threshold, the model summarises older turns server-side and surfaces a
 # CompactionPart we round-trip via the persisted ModelMessage history (docs §7).
-# 150k sits ~2.6x below CHAT_USAGE_LIMITS' 400k hard cap, so compaction (graceful)
-# fires well before UsageLimitExceeded (degrade). Inert until a long, page-heavy
-# chat actually grows; needs a compaction-capable model (Sonnet 4.6 ✓, not Haiku).
+# The threshold sits below CHAT_USAGE_LIMITS' hard cap, so compaction (graceful)
+# fires before UsageLimitExceeded (degrade). Inert until a long, page-heavy chat
+# actually grows; needs a compaction-capable model (Sonnet 4.6 ✓, not Haiku).
 qa_agent = Agent(
-    AnthropicModel(QA_MODEL),
+    AnthropicModel(settings.qa_model),
     deps_type=AppDeps,
     # Typed output: the agent finishes by emitting an `Answer` (markdown +
     # citations) as its final tool call. The run can ONLY end via that tool, so
@@ -202,9 +199,9 @@ qa_agent = Agent(
     # streamed token-by-token — it is returned whole once the tool loop completes.
     output_type=Answer,
     instructions=INSTRUCTIONS,
-    model_settings=_QA_SETTINGS,
-    capabilities=[AnthropicCompaction(token_threshold=300_000)],
-    retries=2,
+    model_settings=QA_SETTINGS,
+    capabilities=[AnthropicCompaction(token_threshold=settings.compaction_token_threshold)],
+    retries=settings.agent_retries,
 )
 
 
@@ -228,7 +225,13 @@ async def current_bundle(ctx: RunContext[AppDeps]) -> str:
         ctx.deps.db, ctx.deps.conversation_id
     )
     if not docs:
-        return "The document bundle is currently EMPTY (0 documents)."
+        return (
+            "The document bundle is currently EMPTY (0 documents). You already know "
+            "this from this instruction, so do NOT call `list_documents` or any other "
+            "tool — there is nothing to read. Answer in one turn: if the user greets "
+            "you or makes small talk, greet back briefly; for anything else, tell them "
+            "the bundle has no documents yet and they can upload PDFs to get started."
+        )
     listing = "\n".join(
         f"- {d.filename} (document_id: {d.id}, {d.page_count} pages)" for d in docs
     )
@@ -244,15 +247,15 @@ async def current_bundle(ctx: RunContext[AppDeps]) -> str:
 
 # Self-describing tool returns: the empty state must instruct the next action so
 # the agent stops instead of re-calling list_documents() until it hits the limit.
-_EMPTY_BUNDLE_GUIDANCE = (
+EMPTY_BUNDLE_GUIDANCE = (
     "The bundle is EMPTY — no documents have been uploaded. Tell the user there is "
     "nothing to analyse yet and to upload documents. Do not call any more tools."
 )
-_BUNDLE_GUIDANCE = (
+BUNDLE_GUIDANCE = (
     "Pick the relevant documents from the cards, then use grep to find pages, "
     "and read_pages to read and quote them."
 )
-_SUMMARIZE_GUIDANCE = (
+SUMMARIZE_GUIDANCE = (
     "Write your answer from these summaries. Cite a claim by copying a `quote` "
     "object's `document_id`, `document_name`, `page`, and `quote` together, VERBATIM "
     "(character-for-character) — always take the document_id from the SAME quote "
@@ -263,7 +266,7 @@ _SUMMARIZE_GUIDANCE = (
 )
 
 
-def _documents_payload(summaries: list[dict[str, object]]) -> dict[str, object]:
+def documents_payload(summaries: list[dict[str, object]]) -> dict[str, object]:
     """Wrap document summaries in a self-describing envelope (count + guidance).
 
     The agent reads `guidance` to decide what to do next — most importantly, the
@@ -272,7 +275,7 @@ def _documents_payload(summaries: list[dict[str, object]]) -> dict[str, object]:
     return {
         "document_count": len(summaries),
         "documents": summaries,
-        "guidance": _BUNDLE_GUIDANCE if summaries else _EMPTY_BUNDLE_GUIDANCE,
+        "guidance": BUNDLE_GUIDANCE if summaries else EMPTY_BUNDLE_GUIDANCE,
     }
 
 
@@ -281,15 +284,14 @@ async def list_documents(ctx: RunContext[AppDeps]) -> dict[str, object]:
     """List the documents in this conversation's bundle.
 
     Call this first (once). Returns `document_count`, the `documents` (each with
-    `document_id`, `document_name`, `page_count`, and a routing `card`: type,
-    parties, date/range, key topics, one-line), and `guidance` for what to do
-    next. If `document_count` is 0 the bundle is empty — tell the user and stop.
-    Cards are hints only, never a source.
+    `document_id`, `document_name`, `page_count`, and a routing `card`: kind,
+    summary), and `guidance` for what to do next. If `document_count` is 0 the
+    bundle is empty — tell the user and stop. Cards are hints only, never a source.
     """
     docs = await document_service.list_documents_for_conversation(
         ctx.deps.db, ctx.deps.conversation_id
     )
-    return _documents_payload(document_service.document_summaries(docs))
+    return documents_payload(document_service.document_summaries(docs))
 
 
 @qa_agent.tool
@@ -379,8 +381,23 @@ async def summarize_documents(
             "No valid document_ids given. Pass the ids (from list_documents()) of "
             "the documents you want summarised."
         )
+
+    # Stream one live Step per document as its map begins, so the breadth path's
+    # per-document work is visible in the live trace.
+    sink = ctx.deps.step_sink
+
+    def on_doc(document_id: str, document_name: str) -> None:
+        if sink is not None:
+            sink(
+                Step(
+                    kind="summarize",
+                    label=f"Summarising {document_name}",
+                    document_id=document_id,
+                )
+            )
+
     findings = await portfolio.map_documents(
-        ctx.deps.conversation_id, question, chosen
+        ctx.deps.conversation_id, question, chosen, on_doc=on_doc
     )
     return {
         "findings": [
@@ -401,31 +418,11 @@ async def summarize_documents(
             }
             for f in findings
         ],
-        "guidance": _SUMMARIZE_GUIDANCE,
+        "guidance": SUMMARIZE_GUIDANCE,
     }
 
 
-def to_model_history(history: Iterable[dict[str, str]]) -> list[ModelMessage]:
-    """Convert stored plain role/content messages into PydanticAI history.
-
-    The back-compat seed for conversations predating the rich-history snapshot:
-    instructions are re-sent each turn by the agent, so history carries only the
-    prior turns' text (docs/pydantic-ai.md §6). Once a turn persists the full
-    `all_messages()` snapshot, that snapshot is replayed instead.
-    """
-    messages: list[ModelMessage] = []
-    for entry in history:
-        role, content = entry.get("role"), entry.get("content")
-        if not content:
-            continue
-        if role == "user":
-            messages.append(ModelRequest(parts=[UserPromptPart(content=content)]))
-        elif role == "assistant":
-            messages.append(ModelResponse(parts=[TextPart(content=content)]))
-    return messages
-
-
-def _tool_step(part: ToolCallPart, names: dict[str, str]) -> Step:
+def tool_step(part: ToolCallPart, names: dict[str, str]) -> Step:
     """Build a human-readable Step from a tool call (no DB access — `names` is a
     pre-fetched document-id → filename map, so this is safe to call mid-run)."""
     try:
@@ -480,18 +477,26 @@ async def answer_question(
     # round-trip during the run.
     docs = await document_service.list_documents_for_conversation(db, conversation_id)
     names = {d.id: d.filename for d in docs}
-    deps = AppDeps(db=db, conversation_id=conversation_id)
 
     # The agent run (tools + verification) runs as a task and pushes items onto a
-    # queue; we yield them in arrival order so steps appear live.
+    # queue; we yield them in arrival order so steps appear live. The queue's
+    # put_nowait doubles as the deps' step_sink, so a tool (summarize_documents)
+    # can stream its own per-document Steps onto the same queue mid-run.
     queue: asyncio.Queue[str | Step | GroundedAnswer | None] = asyncio.Queue()
+    deps = AppDeps(
+        db=db, conversation_id=conversation_id, step_sink=queue.put_nowait
+    )
 
     async def on_event(
         ctx: RunContext[AppDeps], event_stream: AsyncIterable[AgentStreamEvent]
     ) -> None:
         async for event in event_stream:
             if isinstance(event, FunctionToolCallEvent):
-                queue.put_nowait(_tool_step(event.part, names))
+                # summarize_documents emits its own per-document steps via
+                # step_sink; skip the umbrella call so they aren't doubled.
+                if event.part.tool_name == "summarize_documents":
+                    continue
+                queue.put_nowait(tool_step(event.part, names))
 
     async def run() -> None:
         try:
@@ -541,18 +546,3 @@ async def answer_question(
     finally:
         if not task.done():
             task.cancel()
-
-
-title_agent = Agent(TITLE_MODEL)
-
-
-async def generate_title(user_message: str) -> str:
-    """Generate a 3-5 word conversation title from the first user message."""
-    result = await title_agent.run(
-        f"Generate a concise 3-5 word title for a conversation that starts with: "
-        f"'{user_message}'. Return only the title, nothing else."
-    )
-    title = str(result.output).strip().strip('"').strip("'")
-    if len(title) > 100:
-        title = title[:97] + "..."
-    return title

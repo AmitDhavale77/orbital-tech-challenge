@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import uuid
@@ -8,7 +9,7 @@ from typing import Any, cast
 import pymupdf  # PyMuPDF (typed; the legacy `fitz` alias ships no py.typed)
 import structlog
 from fastapi import UploadFile
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.config import settings
@@ -17,9 +18,9 @@ from takehome.services import cards
 
 logger = structlog.get_logger()
 
-# ts_headline options: no markup (so previews read cleanly) and a single short
-# fragment around the match.
-_HEADLINE_OPTIONS = "StartSel=,StopSel=,MaxFragments=1,MaxWords=40,MinWords=15"
+
+class DuplicateDocumentError(ValueError):
+    """Raised when an identical PDF is already in this conversation's bundle."""
 
 
 async def upload_document(
@@ -27,11 +28,12 @@ async def upload_document(
 ) -> Document:
     """Upload and process a PDF document for a conversation.
 
-    Validates the file is a PDF, saves it to disk, extracts text using PyMuPDF,
-    and stores metadata in the database. A conversation owns a Document Bundle,
-    so repeated uploads are accepted (ADR-0001 / ticket 03).
+    Validates the file is a PDF, rejects a byte-for-byte duplicate already in this
+    conversation's bundle, saves it to disk, extracts text using PyMuPDF, and
+    stores metadata in the database.
 
-    Raises ValueError if the file is not a PDF.
+    Raises ValueError if the file is not a PDF or too large, and
+    DuplicateDocumentError if the same PDF is already in the bundle.
     """
     # Validate file type
     if file.content_type not in ("application/pdf", "application/x-pdf"):
@@ -46,6 +48,24 @@ async def upload_document(
     if len(content) > settings.max_upload_size:
         raise ValueError(
             f"File too large. Maximum size is {settings.max_upload_size // (1024 * 1024)}MB."
+        )
+
+    # Dedup: reject a byte-for-byte identical PDF already in THIS bundle. Checked
+    # before writing to disk / extracting so a duplicate is cheap and leaves no
+    # orphan file. Scoped to the conversation — the same PDF in another bundle is
+    # a separate document.
+    content_hash = hashlib.sha256(content).hexdigest()
+    existing = (
+        await session.execute(
+            select(Document.id)
+            .where(Document.conversation_id == conversation_id)
+            .where(Document.content_hash == content_hash)
+        )
+    ).first()
+    if existing is not None:
+        raise DuplicateDocumentError(
+            "This document is already in the bundle — the same PDF cannot be "
+            "uploaded twice."
         )
 
     # Generate a unique filename to avoid collisions
@@ -106,6 +126,7 @@ async def upload_document(
         conversation_id=conversation_id,
         filename=original_filename,
         file_path=file_path,
+        content_hash=content_hash,
         extracted_text=blob if blob else None,
         page_count=page_count,
         card=card,
@@ -313,57 +334,3 @@ async def get_document_pages(
     )
     rows = (await session.execute(stmt)).all()
     return [(int(page_number), text) for page_number, text in rows]
-
-
-async def search_pages(
-    session: AsyncSession,
-    conversation_id: str,
-    query: str,
-    *,
-    per_document: int = 2,
-    limit: int = 8,
-) -> list[dict[str, str | int]]:
-    """Keyword search over the bundle: rank pages, return diversified hits.
-
-    Ranks pages by Postgres full-text relevance and returns the top hits as
-    `(document_id, document_name, page, preview)`, where `preview` is the
-    keyword-in-context fragment (`ts_headline`). A per-document cap stops a long
-    document from burying a short one (ADR-0002). The previews are routing hints:
-    the agent `read_page`s a hit to read the full page and quote it.
-    """
-    tsquery = func.websearch_to_tsquery("english", query)
-    rank = func.ts_rank(Page.tsv, tsquery)
-    preview = func.ts_headline("english", Page.text, tsquery, _HEADLINE_OPTIONS)
-    stmt = (
-        select(
-            Document.id,
-            Document.filename,
-            Page.page_number,
-            preview.label("preview"),
-        )
-        .join(Document, Page.document_id == Document.id)
-        .where(Document.conversation_id == conversation_id)
-        .where(Page.tsv.op("@@")(tsquery))
-        .order_by(rank.desc())
-        .limit(100)  # candidate pool, narrowed by the per-document cap below
-    )
-    rows = (await session.execute(stmt)).all()
-
-    # Per-document cap + global limit (rows are already ranked best-first).
-    seen: dict[str, int] = {}
-    results: list[dict[str, str | int]] = []
-    for document_id, filename, page_number, preview_text in rows:
-        if seen.get(document_id, 0) >= per_document:
-            continue
-        seen[document_id] = seen.get(document_id, 0) + 1
-        results.append(
-            {
-                "document_id": document_id,
-                "document_name": filename,
-                "page": page_number,
-                "preview": " ".join((preview_text or "").split()),
-            }
-        )
-        if len(results) >= limit:
-            break
-    return results

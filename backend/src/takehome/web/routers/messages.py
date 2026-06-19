@@ -16,12 +16,14 @@ from starlette.responses import StreamingResponse
 from takehome.db.models import Message
 from takehome.db.session import get_session
 from takehome.services.citations import GroundedAnswer, VerifiedCitation
-from takehome.services.conversation import get_conversation, update_conversation
+from takehome.services.conversation import (
+    get_conversation,
+    title_from_message,
+    update_conversation,
+)
 from takehome.services.llm import (
     Step,
     answer_question,
-    generate_title,
-    to_model_history,
 )
 
 logger = structlog.get_logger()
@@ -117,25 +119,15 @@ async def send_message(
 
     logger.info("User message saved", conversation_id=conversation_id, message_id=user_message.id)
 
-    # Resolve the agent-replay history. Prefer the rich ModelMessage snapshot
-    # (preserves prior tool calls/returns so a repeated question needn't re-read,
-    # and round-trips compaction); fall back to seeding from the plain-text
-    # `messages` table for conversations created before this feature (docs §6).
-    if conversation.model_history:
-        message_history: list[ModelMessage] = ModelMessagesTypeAdapter.validate_python(
-            conversation.model_history
-        )
-    else:
-        stmt = (
-            select(Message)
-            .where(Message.conversation_id == conversation_id)
-            .where(Message.id != user_message.id)
-            .order_by(Message.created_at.asc())
-        )
-        result = await session.execute(stmt)
-        message_history = to_model_history(
-            {"role": m.role, "content": m.content} for m in result.scalars().all()
-        )
+    # Resolve the agent-replay history: the rich ModelMessage snapshot preserves
+    # prior tool calls/returns so a repeated question needn't re-read, and
+    # round-trips compaction (docs §6). Conversations predating the snapshot simply
+    # start fresh on their next turn.
+    message_history: list[ModelMessage] | None = (
+        ModelMessagesTypeAdapter.validate_python(conversation.model_history)
+        if conversation.model_history
+        else None
+    )
 
     # First user message? (drives title generation) — counted independently of the
     # history branch above so it stays correct when replaying the rich snapshot.
@@ -218,21 +210,16 @@ async def send_message(
             await run_session.commit()
             await run_session.refresh(assistant_message)
 
-            # Auto-generate title from first user message
+            # Title the conversation from its first user message — a cheap,
+            # deterministic truncation (no LLM call).
             if is_first_message:
-                try:
-                    title = await generate_title(body.content)
-                    await update_conversation(run_session, conversation_id, title)
-                    logger.info(
-                        "Auto-generated conversation title",
-                        conversation_id=conversation_id,
-                        title=title,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to generate title",
-                        conversation_id=conversation_id,
-                    )
+                title = title_from_message(body.content)
+                await update_conversation(run_session, conversation_id, title)
+                logger.info(
+                    "Set conversation title",
+                    conversation_id=conversation_id,
+                    title=title,
+                )
 
             # Send the final message event with the complete assistant message
             message_data = json.dumps(

@@ -3,12 +3,17 @@ from __future__ import annotations
 import io
 
 import pymupdf
+import pytest
 from fastapi import UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.db.models import Conversation, Page
-from takehome.services.document import search_pages, upload_document
+from takehome.services.document import (
+    DuplicateDocumentError,
+    grep_pages,
+    upload_document,
+)
 
 
 def _make_pdf(pages: list[str]) -> bytes:
@@ -43,7 +48,7 @@ async def test_upload_creates_one_page_per_pdf_page(db_session: AsyncSession) ->
     assert document.page_count == 2
 
 
-async def test_uploaded_pages_are_searchable(db_session: AsyncSession) -> None:
+async def test_uploaded_pages_are_greppable(db_session: AsyncSession) -> None:
     conversation = Conversation()
     db_session.add(conversation)
     await db_session.commit()
@@ -54,6 +59,21 @@ async def test_uploaded_pages_are_searchable(db_session: AsyncSession) -> None:
     upload = UploadFile(filename="lease.pdf", file=io.BytesIO(content))
     document = await upload_document(db_session, conversation.id, upload)
 
-    # The pages' full-text vectors are populated, so the document is searchable.
-    results = await search_pages(db_session, conversation.id, "rent")
+    # The pages are stored and grep-able by the agent's keyword tool.
+    results = await grep_pages(db_session, conversation.id, "rent")
     assert any(r["document_id"] == document.id for r in results)
+
+
+async def test_same_pdf_cannot_be_uploaded_twice(db_session: AsyncSession) -> None:
+    conversation = Conversation()
+    db_session.add(conversation)
+    await db_session.commit()
+
+    content = _make_pdf(["Identical bytes."])
+    first = UploadFile(filename="dup.pdf", file=io.BytesIO(content))
+    await upload_document(db_session, conversation.id, first)
+
+    # Re-uploading the byte-for-byte identical PDF into the same bundle is rejected.
+    second = UploadFile(filename="dup-renamed.pdf", file=io.BytesIO(content))
+    with pytest.raises(DuplicateDocumentError):
+        await upload_document(db_session, conversation.id, second)

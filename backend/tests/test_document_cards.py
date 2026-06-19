@@ -32,11 +32,8 @@ async def test_card_is_generated_and_stored_on_upload(db_session: AsyncSession) 
                 ToolCallPart(
                     info.output_tools[0].name,
                     {
-                        "type": "Lease",
-                        "parties": ["Landlord X", "Tenant Y"],
-                        "date_or_range": "2024",
-                        "key_topics": ["rent", "term"],
-                        "one_line": "A commercial lease between X and Y.",
+                        "kind": "Lease",
+                        "summary": "A commercial lease between Landlord X and Tenant Y.",
                     },
                 )
             ]
@@ -50,8 +47,8 @@ async def test_card_is_generated_and_stored_on_upload(db_session: AsyncSession) 
         document = await upload_document(db_session, conversation.id, upload)
 
     assert document.card is not None
-    assert document.card["type"] == "Lease"
-    assert document.card["one_line"] == "A commercial lease between X and Y."
+    assert document.card["kind"] == "Lease"
+    assert document.card["summary"] == "A commercial lease between Landlord X and Tenant Y."
 
 
 async def test_list_documents_includes_the_card() -> None:
@@ -61,15 +58,12 @@ async def test_list_documents_includes_the_card() -> None:
         file_path="/tmp/t.pdf",
         page_count=3,
         card={
-            "type": "Official Title Report",
-            "parties": [],
-            "date_or_range": "2023",
-            "key_topics": ["freehold", "covenant"],
-            "one_line": "A title report for Lot 7.",
+            "kind": "Official Title Report",
+            "summary": "A title report for Lot 7.",
         },
     )
 
     summaries = document_summaries([document])
 
     assert {"document_id", "document_name", "page_count", "card"} <= set(summaries[0])
-    assert summaries[0]["card"]["type"] == "Official Title Report"
+    assert summaries[0]["card"]["kind"] == "Official Title Report"

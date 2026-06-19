@@ -7,6 +7,15 @@ from sqlalchemy.orm import selectinload
 from takehome.db.models import Conversation
 
 
+def title_from_message(text: str, limit: int = 40) -> str:
+    """A cheap, deterministic conversation title: the first ~`limit` chars of the
+    first user message (no LLM call). Falls back to "New Conversation" if empty."""
+    collapsed = " ".join(text.split())
+    if not collapsed:
+        return "New Conversation"
+    return collapsed[:limit] + "…" if len(collapsed) > limit else collapsed
+
+
 async def create_conversation(session: AsyncSession) -> Conversation:
     """Create a new conversation with default title."""
     conversation = Conversation()

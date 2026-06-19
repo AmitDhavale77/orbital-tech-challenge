@@ -21,10 +21,12 @@ amendment.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 
 from pydantic import BaseModel
 from pydantic_ai import Agent
 
+from takehome.config import settings
 from takehome.services import document as document_service
 from takehome.services.citations import (
     Answer,
@@ -33,15 +35,7 @@ from takehome.services.citations import (
     verify_and_renumber,
 )
 
-# Haiku for the per-doc map (cheap, runs N× in parallel); Sonnet for the reduce
-# synthesis (CLAUDE.md model policy).
-MAP_MODEL = "anthropic:claude-haiku-4-5-20251001"
-REDUCE_MODEL = "anthropic:claude-sonnet-4-6"
-# Cap concurrent per-doc agent calls so a 50-doc bundle doesn't open 50 LLM
-# requests (and DB sessions) at once.
-MAP_CONCURRENCY = 5
-
-_MAP_INSTRUCTIONS = (
+MAP_INSTRUCTIONS = (
     "You analyse ONE document from a commercial real estate Document Bundle to help "
     "answer a lawyer's question about the whole bundle. You are given that document's "
     "full text with `--- Page N ---` markers.\n"
@@ -53,7 +47,7 @@ _MAP_INSTRUCTIONS = (
     "knowledge; quote only text that appears in THIS document."
 )
 
-_REDUCE_INSTRUCTIONS = (
+REDUCE_INSTRUCTIONS = (
     "You synthesise per-document findings into a single answer to a lawyer's question "
     "across a commercial real estate Document Bundle. You are given, for each relevant "
     "document, its name, its document_id, a summary, and supporting verbatim quotes with "
@@ -99,11 +93,17 @@ class PortfolioAnswer(BaseModel):
     rows: list[DocFinding] = []
 
 
-map_agent = Agent(MAP_MODEL, output_type=MapResult, instructions=_MAP_INSTRUCTIONS)
-reduce_agent = Agent(REDUCE_MODEL, output_type=Answer, instructions=_REDUCE_INSTRUCTIONS)
+# Haiku for the per-doc map (cheap, runs N× in parallel); Sonnet for the reduce
+# synthesis (CLAUDE.md model policy). Models live in config.py.
+map_agent = Agent(
+    settings.map_model, output_type=MapResult, instructions=MAP_INSTRUCTIONS
+)
+reduce_agent = Agent(
+    settings.reduce_model, output_type=Answer, instructions=REDUCE_INSTRUCTIONS
+)
 
 
-def _map_prompt(question: str, document_name: str, document_text: str) -> str:
+def map_prompt(question: str, document_name: str, document_text: str) -> str:
     return (
         f"Question about the bundle: {question}\n\n"
         f"Document: {document_name}\n\n"
@@ -111,7 +111,7 @@ def _map_prompt(question: str, document_name: str, document_text: str) -> str:
     )
 
 
-def _reduce_context(findings: list[DocFinding]) -> str:
+def reduce_context(findings: list[DocFinding]) -> str:
     blocks: list[str] = []
     for finding in findings:
         lines = [f"Document: {finding.document_name} (document_id: {finding.document_id})"]
@@ -124,12 +124,23 @@ def _reduce_context(findings: list[DocFinding]) -> str:
     return "\n\n".join(blocks)
 
 
-async def _map_one(
-    conversation_id: str, document_id: str, document_name: str, question: str
+async def map_one(
+    conversation_id: str,
+    document_id: str,
+    document_name: str,
+    question: str,
+    on_doc: Callable[[str, str], None] | None = None,
 ) -> DocFinding:
     """Map one document → a verified finding. Opens its own session so parallel
-    map tasks never share a session (AsyncSession is not concurrency-safe)."""
+    map tasks never share a session (AsyncSession is not concurrency-safe).
+
+    `on_doc(document_id, document_name)` (if given) fires as this document's map
+    begins, so a caller can stream live per-document progress.
+    """
     from takehome.db.session import async_session
+
+    if on_doc is not None:
+        on_doc(document_id, document_name)
 
     async with async_session() as session:
         text = await document_service.get_document_text(
@@ -139,7 +150,7 @@ async def _map_one(
             return DocFinding(
                 document_id=document_id, document_name=document_name, relevant=False
             )
-        result = await map_agent.run(_map_prompt(question, document_name, text))
+        result = await map_agent.run(map_prompt(question, document_name, text))
         mapped = result.output
         if not mapped.relevant:
             return DocFinding(
@@ -169,7 +180,7 @@ async def _map_one(
         )
 
 
-async def _reduce(
+async def reduce(
     conversation_id: str, question: str, findings: list[DocFinding]
 ) -> tuple[str, list[VerifiedCitation]]:
     """Reduce relevant findings → one grounded answer (citations re-verified)."""
@@ -177,7 +188,7 @@ async def _reduce(
 
     result = await reduce_agent.run(
         f"Question: {question}\n\n"
-        f"Findings from the relevant documents:\n\n{_reduce_context(findings)}"
+        f"Findings from the relevant documents:\n\n{reduce_context(findings)}"
     )
     answer = result.output
     async with async_session() as session:
@@ -186,20 +197,23 @@ async def _reduce(
         )
 
 
-async def _gather_maps(
+async def gather_maps(
     conversation_id: str,
     question: str,
     meta: list[tuple[str, str]],
     concurrency: int,
+    on_doc: Callable[[str, str], None] | None = None,
 ) -> list[DocFinding]:
-    """Run `_map_one` over (document_id, document_name) pairs in parallel, capped
+    """Run `map_one` over (document_id, document_name) pairs in parallel, capped
     by a semaphore so a large bundle doesn't open one LLM request (and session)
     per document at once."""
     semaphore = asyncio.Semaphore(concurrency)
 
     async def guarded(document_id: str, document_name: str) -> DocFinding:
         async with semaphore:
-            return await _map_one(conversation_id, document_id, document_name, question)
+            return await map_one(
+                conversation_id, document_id, document_name, question, on_doc
+            )
 
     return list(await asyncio.gather(*(guarded(d, n) for d, n in meta)))
 
@@ -209,7 +223,8 @@ async def map_documents(
     question: str,
     document_ids: list[str],
     *,
-    concurrency: int = MAP_CONCURRENCY,
+    concurrency: int = settings.map_concurrency,
+    on_doc: Callable[[str, str], None] | None = None,
 ) -> list[DocFinding]:
     """Map the named documents in PARALLEL → one finding each, no reduce.
 
@@ -218,6 +233,7 @@ async def map_documents(
     subagent context (Haiku), returning a summary plus verbatim, page-verified
     quotes. The chat agent itself is the reduce — it synthesises and cites these
     findings — so this stops at the map. Ids not in the bundle are skipped.
+    `on_doc` (if given) fires per document as its map begins, for live progress.
     """
     from takehome.db.session import async_session
 
@@ -227,11 +243,11 @@ async def map_documents(
         )
     wanted = set(document_ids)
     meta = [(d.id, d.filename) for d in documents if d.id in wanted]
-    return await _gather_maps(conversation_id, question, meta, concurrency)
+    return await gather_maps(conversation_id, question, meta, concurrency, on_doc)
 
 
 async def analyze_portfolio(
-    conversation_id: str, question: str, *, concurrency: int = MAP_CONCURRENCY
+    conversation_id: str, question: str, *, concurrency: int = settings.map_concurrency
 ) -> PortfolioAnswer:
     """Run map-reduce over the conversation's whole bundle and return the answer
     plus one finding row per document."""
@@ -242,12 +258,12 @@ async def analyze_portfolio(
             session, conversation_id
         )
     meta = [(d.id, d.filename) for d in documents]
-    findings = await _gather_maps(conversation_id, question, meta, concurrency)
+    findings = await gather_maps(conversation_id, question, meta, concurrency)
     relevant = [f for f in findings if f.relevant]
     if not relevant:
         return PortfolioAnswer(
             markdown="Not specified — no document in the bundle addresses this question.",
             rows=findings,
         )
-    markdown, citations = await _reduce(conversation_id, question, relevant)
+    markdown, citations = await reduce(conversation_id, question, relevant)
     return PortfolioAnswer(markdown=markdown, citations=citations, rows=findings)

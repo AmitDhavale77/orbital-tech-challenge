@@ -400,3 +400,28 @@ async def test_map_documents_keeps_bracketed_summary_text_verbatim(
     assert len(findings) == 1
     assert findings[0].summary == "Rent reviewed in [2024]; see Schedule [4]."
     assert [c.quote for c in findings[0].citations] == [LEASE_P1]
+
+
+async def test_map_documents_reports_each_document_via_on_doc(
+    sessionmaker: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The breadth path streams per-document progress: `on_doc` fires once per
+    mapped document with its (id, name), backing the live chat summarize steps."""
+    import takehome.db.session as db_session_module
+
+    monkeypatch.setattr(db_session_module, "async_session", sessionmaker)
+    async with sessionmaker() as session:
+        conv_id, lease_id, deed_id = await _seed_two_docs(session)
+
+    seen: list[tuple[str, str]] = []
+    with map_agent.override(model=FunctionModel(_map_returns_its_page1)):
+        await map_documents(
+            conv_id,
+            "Which documents grant parking rights?",
+            [lease_id, deed_id],
+            on_doc=lambda doc_id, name: seen.append((doc_id, name)),
+        )
+
+    assert sorted(seen) == sorted(
+        [(lease_id, "lease.pdf"), (deed_id, "deed.pdf")]
+    )

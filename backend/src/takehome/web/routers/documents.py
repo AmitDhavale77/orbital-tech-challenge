@@ -11,7 +11,11 @@ from starlette.responses import FileResponse
 
 from takehome.db.session import get_session
 from takehome.services.conversation import get_conversation
-from takehome.services.document import get_document, upload_document
+from takehome.services.document import (
+    DuplicateDocumentError,
+    get_document,
+    upload_document,
+)
 
 logger = structlog.get_logger()
 
@@ -50,7 +54,8 @@ async def upload_document_endpoint(
 ) -> DocumentOut:
     """Upload a PDF document into a conversation's bundle.
 
-    A conversation owns many documents, so repeated uploads are accepted.
+    A conversation owns many documents, but the same PDF cannot be uploaded twice
+    into one bundle — an identical file returns 409.
     """
     # Verify the conversation exists
     conversation = await get_conversation(session, conversation_id)
@@ -59,6 +64,8 @@ async def upload_document_endpoint(
 
     try:
         document = await upload_document(session, conversation_id, file)
+    except DuplicateDocumentError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
