@@ -152,7 +152,6 @@ export function MessageBubble({
 		);
 	}
 
-	// Assistant message
 	return (
 		<motion.div
 			initial={{ opacity: 0, y: 8 }}

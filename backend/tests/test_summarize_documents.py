@@ -11,7 +11,6 @@ from pydantic_ai.messages import (
     RetryPromptPart,
     ToolCallPart,
     ToolReturnPart,
-    UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -19,49 +18,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from takehome.db.models import Conversation, Document, Page
 from takehome.services.llm import qa_agent
 from takehome.services.portfolio import map_agent, map_documents
+from tests.helpers import last_user_text, page1, parse_sse, tool_returns
 
 LEASE_P1 = "The lease grants parking rights to the tenant."
 DEED_P1 = "The deed grants parking rights and a right of way."
 
 
-def _parse_sse(body: str) -> list[dict[str, Any]]:
-    return [
-        json.loads(line[len("data: ") :])
-        for line in body.splitlines()
-        if line.startswith("data: ")
-    ]
-
-
-def _tool_returns(messages: list[ModelMessage]) -> int:
-    return sum(
-        isinstance(part, ToolReturnPart)
-        for message in messages
-        for part in getattr(message, "parts", [])
-    )
-
-
-def _last_user_text(messages: list[ModelMessage]) -> str:
-    for message in reversed(messages):
-        for part in getattr(message, "parts", []):
-            if isinstance(part, UserPromptPart) and isinstance(part.content, str):
-                return part.content
-    return ""
-
-
-def _page1(prompt: str) -> str:
-    """Pull page 1's verbatim text out of a map prompt, so the fake map agent can
-    return a quote that actually verifies against the seeded page."""
-    rest = prompt.split("--- Page 1 ---\n", 1)[1]
-    for stop in ("\n\n--- ", "\n--- "):
-        idx = rest.find(stop)
-        if idx != -1:
-            rest = rest[:idx]
-    return rest.strip()
-
-
 def _map_returns_its_page1(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
     """A fake per-document map: relevant, quoting this document's verbatim page 1."""
-    quote = _page1(_last_user_text(messages))
+    quote = page1(last_user_text(messages))
     return ModelResponse(
         parts=[
             ToolCallPart(
@@ -96,7 +61,7 @@ async def test_breadth_question_fans_out_via_summarize_documents_and_cites(
     tool_calls: list[str] = []
 
     async def chat_fn(messages: list[ModelMessage], info: AgentInfo):
-        if _tool_returns(messages) == 0:
+        if tool_returns(messages) == 0:
             tool_calls.append("summarize_documents")
             yield {
                 0: DeltaToolCall(
@@ -139,7 +104,7 @@ async def test_breadth_question_fans_out_via_summarize_documents_and_cites(
     assert response.status_code == 200, response.text
     # Routing: the breadth question went through the new breadth tool.
     assert tool_calls == ["summarize_documents"]
-    events = _parse_sse(response.text)
+    events = parse_sse(response.text)
     # Grounding survives the fan-out → reduce hop: both per-doc quotes verify.
     message = next(e["message"] for e in events if e.get("type") == "message")
     assert {c["document_id"] for c in message["citations"]} == {lease_id, deed_id}
@@ -207,7 +172,7 @@ async def test_summarize_documents_steers_when_no_valid_ids(
     # The empty-ids call bounced back a ModelRetry (not a silent empty result),
     # so the agent saw a retry prompt before correcting and answering.
     assert saw_retry, "empty document_ids should be steered with a ModelRetry"
-    events = _parse_sse(response.text)
+    events = parse_sse(response.text)
     message = next(e["message"] for e in events if e.get("type") == "message")
     assert message["citations"][0]["document_id"] == lease_id
 
@@ -225,7 +190,7 @@ async def test_summarize_documents_proceeds_with_partially_valid_ids(
             for part in getattr(message, "parts", [])
         ):
             saw_retry.append(True)
-        if _tool_returns(messages) == 0:
+        if tool_returns(messages) == 0:
             # One real id + one bogus id — the bogus id is skipped, the call proceeds.
             yield {
                 0: DeltaToolCall(
@@ -262,7 +227,7 @@ async def test_summarize_documents_proceeds_with_partially_valid_ids(
     assert response.status_code == 200, response.text
     # A list with >=1 valid id proceeds (the bogus id is silently skipped) — no steer.
     assert not saw_retry
-    events = _parse_sse(response.text)
+    events = parse_sse(response.text)
     message = next(e["message"] for e in events if e.get("type") == "message")
     assert message["citations"][0]["document_id"] == lease_id
 
@@ -271,8 +236,8 @@ def _map_relevant_if_parking(
     messages: list[ModelMessage], info: AgentInfo
 ) -> ModelResponse:
     """A fake map that is relevant only if this document's page 1 mentions parking."""
-    page1 = _page1(_last_user_text(messages))
-    relevant = "parking" in page1.lower()
+    page_text = page1(last_user_text(messages))
+    relevant = "parking" in page_text.lower()
     return ModelResponse(
         parts=[
             ToolCallPart(
@@ -280,7 +245,7 @@ def _map_relevant_if_parking(
                 args={
                     "relevant": relevant,
                     "summary": "Grants parking." if relevant else "",
-                    "quotes": [{"page": 1, "quote": page1}] if relevant else [],
+                    "quotes": [{"page": 1, "quote": page_text}] if relevant else [],
                 },
             )
         ]
@@ -305,17 +270,17 @@ async def test_irrelevant_document_is_excluded_from_breadth_answer(
     await db_session.commit()
     conv_id, lease_id, memo_id = conversation.id, lease.id, memo.id
 
-    tool_returns: list[Any] = []
+    summarize_payloads: list[Any] = []
 
     async def chat_fn(messages: list[ModelMessage], info: AgentInfo):
         for message in messages:
             for part in getattr(message, "parts", []):
                 if isinstance(part, ToolReturnPart) and part.tool_name == "summarize_documents":
                     content = part.content
-                    tool_returns.append(
+                    summarize_payloads.append(
                         json.loads(content) if isinstance(content, str) else content
                     )
-        if _tool_returns(messages) == 0:
+        if tool_returns(messages) == 0:
             yield {
                 0: DeltaToolCall(
                     name="summarize_documents",
@@ -351,11 +316,11 @@ async def test_irrelevant_document_is_excluded_from_breadth_answer(
 
     assert response.status_code == 200, response.text
     # The tool surfaces the memo as relevant=false with no quotes...
-    findings = {f["document_id"]: f for f in tool_returns[0]["findings"]}
+    findings = {f["document_id"]: f for f in summarize_payloads[0]["findings"]}
     assert findings[lease_id]["relevant"] is True and findings[lease_id]["quotes"]
     assert findings[memo_id]["relevant"] is False and findings[memo_id]["quotes"] == []
     # ...and the irrelevant memo never reaches the final answer's citations.
-    msg = next(e["message"] for e in _parse_sse(response.text) if e.get("type") == "message")
+    msg = next(e["message"] for e in parse_sse(response.text) if e.get("type") == "message")
     assert {c["document_id"] for c in msg["citations"]} == {lease_id}
 
 
@@ -380,7 +345,7 @@ async def test_map_documents_keeps_bracketed_summary_text_verbatim(
         conv_id, lease_id = conversation.id, lease.id
 
     def map_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        quote = _page1(_last_user_text(messages))
+        quote = page1(last_user_text(messages))
         return ModelResponse(
             parts=[
                 ToolCallPart(

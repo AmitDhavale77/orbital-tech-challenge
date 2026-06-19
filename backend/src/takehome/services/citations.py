@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 import structlog
@@ -26,12 +27,13 @@ class Citation(BaseModel):
 
 
 class Answer(BaseModel):
-    """A typed answer (markdown + citations) for the batch portfolio path.
+    """A typed answer: markdown plus the citations that support it.
 
-    The interactive chat agent streams native text and gathers citations via the
-    `cite` tool instead (Anthropic buffers tool-call JSON, so a structured output
-    can't stream token-by-token); this model is used by the non-streaming
-    map-reduce fan-out in `portfolio.py`.
+    The final structured output of both the interactive chat agent (`llm.py`) and
+    the map-reduce reduce step (`portfolio.py`). Citations ride along with the
+    answer rather than via a separate `cite` tool, and it is returned whole, not
+    streamed token-by-token (Anthropic buffers tool-call JSON) — only the tool
+    steps stream live.
     """
 
     markdown: str
@@ -81,23 +83,88 @@ _PUNCT = str.maketrans(
 )
 
 
-def _normalize(text: str) -> str:
-    """Collapse whitespace and normalise smart punctuation, then strip.
+# Zero-width / formatting characters PDFs and models inject that carry no meaning.
+_ZERO_WIDTH = str.maketrans(
+    {
+        "​": "",  # zero-width space
+        "‌": "",  # zero-width non-joiner
+        "‍": "",  # zero-width joiner
+        "﻿": "",  # zero-width no-break space / BOM
+        "­": "",  # soft hyphen
+    }
+)
+# A hyphen immediately before a line break = a word wrapped across lines in the
+# PDF text layer ("inter-\nest" -> "interest"). En/em dashes are already ascii "-"
+# by the time this runs (see _normalize order), so we only handle "-".
+_DEHYPHENATE = re.compile(r"-\s*\n\s*")
+# "…" or "..." — an author-inserted elision the model may use to bridge two spans.
+_ELLIPSIS = re.compile(r"…|\.\.\.+")
+# Minimum length for an ellipsis fragment to count, so a stray "..." can't
+# manufacture a trivially-true match out of a few characters.
+_MIN_FRAGMENT = 12
 
-    PDF extraction wraps lines and doubles spaces, and models reproduce curly
-    quotes / dashes inconsistently, so a verbatim quote rarely matches
-    byte-for-byte. This keeps the match robust while staying faithful to the
-    exact tokens (case preserved).
+
+def _normalize(text: str) -> str:
+    """Canonicalise text so a faithful quote matches the page despite formatting.
+
+    PDF extraction wraps lines, doubles spaces, emits ligatures and soft hyphens;
+    models reproduce curly quotes / dashes / case inconsistently. We fold all of
+    that to a canonical form — applied identically to quote and page — so only a
+    genuine difference in *words* (a wrong number, a changed term) can fail the
+    match. Order matters: NFKC first (so ligatures / full-width expand and soft- /
+    zero-width chars survive to be stripped), then punctuation, then de-hyphenation
+    (needs the real newline), then whitespace collapse, then casefold.
     """
-    return _WHITESPACE.sub(" ", text.translate(_PUNCT)).strip()
+    text = unicodedata.normalize("NFKC", text)
+    text = text.translate(_ZERO_WIDTH)
+    text = text.translate(_PUNCT)
+    text = _DEHYPHENATE.sub("", text)
+    text = _WHITESPACE.sub(" ", text)
+    return text.casefold().strip()
+
+
+def _fragments(needle: str) -> list[str]:
+    """Split an already-normalised needle on ellipsis into substantial fragments.
+
+    No ellipsis → `[needle]`, so a short legitimate quote ("£50,000") keeps exact
+    substring behaviour. With an ellipsis, only fragments >= _MIN_FRAGMENT survive.
+    """
+    parts = [p.strip() for p in _ELLIPSIS.split(needle)]
+    if len(parts) == 1:
+        return parts
+    return [p for p in parts if len(p) >= _MIN_FRAGMENT]
+
+
+def _contains(haystack: str, needle: str) -> bool:
+    """True if `needle` is found in `haystack`, tolerant of formatting only.
+
+    A single-fragment needle must be an exact normalised substring. An
+    ellipsis-split needle requires every substantial fragment to appear in
+    `haystack` IN ORDER — each still an exact substring, so no fabricated word or
+    number slips through, and reordered or cross-text stitching is rejected.
+    """
+    hay = _normalize(haystack)
+    fragments = _fragments(_normalize(needle))
+    if not fragments or not all(fragments):
+        return False
+    if len(fragments) == 1:
+        return fragments[0] in hay
+    pos = 0
+    for fragment in fragments:
+        index = hay.find(fragment, pos)
+        if index == -1:
+            return False
+        pos = index + len(fragment)
+    return True
 
 
 def verify_quote(quote: str, page_text: str) -> bool:
-    """True if `quote` appears in `page_text`, tolerant of whitespace only."""
-    needle = _normalize(quote)
-    if not needle:
+    """True if `quote` appears in `page_text`, tolerant of formatting differences
+    (whitespace, case, smart punctuation, ligatures, line-break hyphenation) and of
+    an author-inserted ellipsis bridging two verbatim spans on the page."""
+    if not _normalize(quote):
         return False
-    return needle in _normalize(page_text)
+    return _contains(page_text, quote)
 
 
 def locate_quote(quote: str, pages: list[tuple[int, str]], preferred: int) -> int | None:
@@ -106,17 +173,16 @@ def locate_quote(quote: str, pages: list[tuple[int, str]], preferred: int) -> in
     Reading a whole document, the model often cites the right quote on the wrong
     page. Rather than drop a genuinely-present quote, we accept it on whichever
     page actually contains it — preferring the cited page when it matches, so a
-    quote that legitimately recurs stays anchored where the model put it.
+    quote that legitimately recurs stays anchored where the model put it. An
+    ellipsis quote must be satisfied entirely within a single page.
     """
-    needle = _normalize(quote)
-    if not needle:
+    if not _normalize(quote):
         return None
-    pages_by_text = [(n, _normalize(t)) for n, t in pages]
-    for page_number, text in pages_by_text:
-        if page_number == preferred and needle in text:
+    for page_number, text in pages:
+        if page_number == preferred and _contains(text, quote):
             return preferred
-    for page_number, text in pages_by_text:
-        if needle in text:
+    for page_number, text in pages:
+        if _contains(text, quote):
             return page_number
     return None
 

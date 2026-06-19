@@ -6,7 +6,7 @@ import re
 import uuid
 from typing import Any, cast
 
-import pymupdf  # PyMuPDF (typed; the legacy `fitz` alias ships no py.typed)
+import pymupdf
 import structlog
 from fastapi import UploadFile
 from sqlalchemy import select
@@ -35,25 +35,20 @@ async def upload_document(
     Raises ValueError if the file is not a PDF or too large, and
     DuplicateDocumentError if the same PDF is already in the bundle.
     """
-    # Validate file type
     if file.content_type not in ("application/pdf", "application/x-pdf"):
         filename = file.filename or ""
         if not filename.lower().endswith(".pdf"):
             raise ValueError("Only PDF files are supported.")
 
-    # Read file content
     content = await file.read()
 
-    # Validate file size
     if len(content) > settings.max_upload_size:
         raise ValueError(
             f"File too large. Maximum size is {settings.max_upload_size // (1024 * 1024)}MB."
         )
 
-    # Dedup: reject a byte-for-byte identical PDF already in THIS bundle. Checked
-    # before writing to disk / extracting so a duplicate is cheap and leaves no
-    # orphan file. Scoped to the conversation — the same PDF in another bundle is
-    # a separate document.
+    # Skip exact duplicates in the same bundle before we save or extract the file.
+    # The same PDF in another bundle is still treated as a separate document.
     content_hash = hashlib.sha256(content).hexdigest()
     existing = (
         await session.execute(
@@ -68,31 +63,26 @@ async def upload_document(
             "uploaded twice."
         )
 
-    # Generate a unique filename to avoid collisions
     original_filename = file.filename or "document.pdf"
     unique_name = f"{uuid.uuid4().hex}_{original_filename}"
     file_path = os.path.join(settings.upload_dir, unique_name)
 
-    # Ensure upload directory exists
     os.makedirs(settings.upload_dir, exist_ok=True)
 
-    # Save the file to disk
     with open(file_path, "wb") as f:
         f.write(content)
 
     logger.info("Saved uploaded PDF", filename=original_filename, path=file_path, size=len(content))
 
-    # Extract text per page using PyMuPDF. Each page becomes a Page row — the
-    # unit the agent reads on demand and a Citation later anchors to (ADR-0002).
-    # `extracted_text` is kept populated for backward compatibility, but it is
-    # no longer the path the agent reads from.
+    # Extract text page by page. Pages are what the agent reads later, and citations
+    # anchor back to them. `extracted_text` is still filled for older code paths.
     page_texts: list[str] = []
     page_count = 0
     try:
         doc = pymupdf.open(file_path)
         page_count = len(doc)
         for page_num in range(page_count):
-            page = doc[page_num]
+            page = doc.load_page(page_num)  # pyright: ignore[reportUnknownMemberType]
             # Default option ("text") returns a str; the stub widens the return.
             page_texts.append(cast(str, page.get_text()))  # pyright: ignore[reportUnknownMemberType]
         doc.close()
@@ -121,7 +111,6 @@ async def upload_document(
         except Exception:
             logger.exception("Failed to generate document card", filename=original_filename)
 
-    # Create the document record with one Page per PDF page.
     document = Document(
         conversation_id=conversation_id,
         filename=original_filename,
@@ -231,7 +220,8 @@ async def get_document_text(
     numbers are preserved, so the markers stay accurate.
 
     Returns None when the document is not in this conversation or has no readable
-    text — the agent's `read_document` tool turns that into a ModelRetry.
+    text — the breadth map (`portfolio.map_one`) treats that as a non-relevant
+    finding.
     """
     stmt = (
         select(Page.page_number, Page.text)

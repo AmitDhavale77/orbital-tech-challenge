@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 
-import pymupdf
 import pytest
 from fastapi import UploadFile
 from sqlalchemy import select
@@ -14,14 +13,7 @@ from takehome.services.document import (
     grep_pages,
     upload_document,
 )
-
-
-def _make_pdf(pages: list[str]) -> bytes:
-    doc = pymupdf.open()
-    for body in pages:
-        page = doc.new_page()
-        page.insert_text((72, 72), body)
-    return doc.tobytes()
+from tests.helpers import make_pdf
 
 
 async def test_upload_creates_one_page_per_pdf_page(db_session: AsyncSession) -> None:
@@ -29,7 +21,7 @@ async def test_upload_creates_one_page_per_pdf_page(db_session: AsyncSession) ->
     db_session.add(conversation)
     await db_session.commit()
 
-    content = _make_pdf(["Hello page one rent", "Page two break clause"])
+    content = make_pdf("Hello page one rent", "Page two break clause")
     upload = UploadFile(filename="lease.pdf", file=io.BytesIO(content))
 
     document = await upload_document(db_session, conversation.id, upload)
@@ -53,8 +45,8 @@ async def test_uploaded_pages_are_greppable(db_session: AsyncSession) -> None:
     db_session.add(conversation)
     await db_session.commit()
 
-    content = _make_pdf(
-        ["The tenant shall pay the rent quarterly.", "Break clause notice period."]
+    content = make_pdf(
+        "The tenant shall pay the rent quarterly.", "Break clause notice period."
     )
     upload = UploadFile(filename="lease.pdf", file=io.BytesIO(content))
     document = await upload_document(db_session, conversation.id, upload)
@@ -69,7 +61,7 @@ async def test_same_pdf_cannot_be_uploaded_twice(db_session: AsyncSession) -> No
     db_session.add(conversation)
     await db_session.commit()
 
-    content = _make_pdf(["Identical bytes."])
+    content = make_pdf("Identical bytes.")
     first = UploadFile(filename="dup.pdf", file=io.BytesIO(content))
     await upload_document(db_session, conversation.id, first)
 

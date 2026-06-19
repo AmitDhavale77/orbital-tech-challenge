@@ -67,7 +67,6 @@ async def list_messages(
     session: AsyncSession = Depends(get_session),
 ) -> list[MessageOut]:
     """List all messages in a conversation, ordered by creation time."""
-    # Verify the conversation exists
     conversation = await get_conversation(session, conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -102,12 +101,10 @@ async def send_message(
     session: AsyncSession = Depends(get_session),
 ) -> StreamingResponse:
     """Send a user message and stream back the AI response via SSE."""
-    # Verify the conversation exists
     conversation = await get_conversation(session, conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Save the user message
     user_message = Message(
         conversation_id=conversation_id,
         role="user",
@@ -221,7 +218,6 @@ async def send_message(
                     title=title,
                 )
 
-            # Send the final message event with the complete assistant message
             message_data = json.dumps(
                 {
                     "type": "message",
@@ -239,7 +235,6 @@ async def send_message(
             )
             yield f"data: {message_data}\n\n"
 
-            # Send the done signal
             done_data = json.dumps(
                 {
                     "type": "done",

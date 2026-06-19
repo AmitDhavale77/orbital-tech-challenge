@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     # AnthropicModel(...); the others are passed straight to Agent(...).
     qa_model: str = "claude-sonnet-4-6"
     card_model: str = "anthropic:claude-haiku-4-5-20251001"
-    map_model: str = "anthropic:claude-haiku-4-5-20251001"
+    map_model: str = "anthropic:claude-sonnet-4-6"
     reduce_model: str = "anthropic:claude-sonnet-4-6"
 
     # --- Token / consumption knobs --------------------------------------- #

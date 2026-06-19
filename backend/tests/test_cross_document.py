@@ -1,39 +1,15 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
-import pymupdf
 from httpx import AsyncClient
-from pydantic_ai.messages import ModelMessage, ToolReturnPart
+from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.db.models import Conversation, Document, Page
 from takehome.services.llm import qa_agent
-
-
-def _pdf(text: str) -> bytes:
-    doc = pymupdf.open()
-    page = doc.new_page()
-    page.insert_text((72, 72), text)
-    return doc.tobytes()
-
-
-def _parse_sse(body: str) -> list[dict[str, Any]]:
-    return [
-        json.loads(line[len("data: ") :])
-        for line in body.splitlines()
-        if line.startswith("data: ")
-    ]
-
-
-def _tool_returns(messages: list[ModelMessage]) -> int:
-    return sum(
-        isinstance(part, ToolReturnPart)
-        for message in messages
-        for part in getattr(message, "parts", [])
-    )
+from tests.helpers import make_pdf, parse_sse, tool_returns
 
 
 async def test_conversation_accepts_multiple_uploads(client: AsyncClient) -> None:
@@ -43,7 +19,7 @@ async def test_conversation_accepts_multiple_uploads(client: AsyncClient) -> Non
     for name in ("lease.pdf", "deed.pdf", "title.pdf"):
         resp = await client.post(
             f"/api/conversations/{cid}/documents",
-            files={"file": (name, _pdf(f"contents of {name}"), "application/pdf")},
+            files={"file": (name, make_pdf(f"contents of {name}"), "application/pdf")},
         )
         assert resp.status_code == 201, resp.text  # no 409 "already has a document"
 
@@ -80,7 +56,7 @@ async def test_answer_cites_across_multiple_documents(
     await db_session.commit()
 
     async def stream_function(messages: list[ModelMessage], info: AgentInfo):
-        seen = _tool_returns(messages)
+        seen = tool_returns(messages)
         if seen == 0:
             yield {0: DeltaToolCall(name="read_pages", json_args=json.dumps({"document_id": lease.id, "start_page": 1}))}
         elif seen == 1:
@@ -108,7 +84,7 @@ async def test_answer_cites_across_multiple_documents(
         )
 
     assert response.status_code == 200
-    events = _parse_sse(response.text)
+    events = parse_sse(response.text)
     message = next(e["message"] for e in events if e.get("type") == "message")
     cited_docs = {c["document_id"] for c in message["citations"]}
     assert cited_docs == {lease.id, deed.id}

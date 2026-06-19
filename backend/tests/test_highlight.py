@@ -10,8 +10,8 @@ from takehome.services.document import compute_quote_rects
 def _write_pdf(path: Path, text: str) -> None:
     doc = pymupdf.open()
     page = doc.new_page()
-    page.insert_text((72, 72), text)
-    doc.save(str(path))
+    page.insert_text((72, 72), text)  # pyright: ignore[reportUnknownMemberType]
+    doc.save(str(path))  # pyright: ignore[reportUnknownMemberType]
 
 
 def test_rects_found_for_a_known_quote(tmp_path: Path) -> None:

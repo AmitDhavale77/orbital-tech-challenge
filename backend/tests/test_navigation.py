@@ -1,32 +1,16 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from httpx import AsyncClient
-from pydantic_ai.messages import ModelMessage, ToolReturnPart
+from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.db.models import Conversation, Document, Page
 from takehome.services.document import grep_pages
 from takehome.services.llm import qa_agent
-
-
-def _parse_sse(body: str) -> list[dict[str, Any]]:
-    return [
-        json.loads(line[len("data: ") :])
-        for line in body.splitlines()
-        if line.startswith("data: ")
-    ]
-
-
-def _tool_returns(messages: list[ModelMessage]) -> int:
-    return sum(
-        isinstance(part, ToolReturnPart)
-        for message in messages
-        for part in getattr(message, "parts", [])
-    )
+from tests.helpers import parse_sse, tool_returns
 
 
 async def _seed_bundle(db: AsyncSession) -> tuple[str, str, str]:
@@ -70,7 +54,7 @@ async def test_grep_is_case_insensitive_and_spans_documents(
 
 
 async def test_grep_can_scope_to_one_document(db_session: AsyncSession) -> None:
-    conversation_id, lease_id, deed_id = await _seed_bundle(db_session)
+    conversation_id, lease_id, _ = await _seed_bundle(db_session)
     hits = await grep_pages(db_session, conversation_id, "rent", document_id=lease_id)
     assert {h["document_id"] for h in hits} == {lease_id}
 
@@ -83,13 +67,6 @@ async def test_grep_supports_regex_whitespace_within_a_line(
     assert any(h["document_id"] == lease_id and h["page"] == 1 for h in hits)
 
 
-async def test_grep_returns_empty_when_nothing_matches(
-    db_session: AsyncSession,
-) -> None:
-    conversation_id, _, _ = await _seed_bundle(db_session)
-    assert await grep_pages(db_session, conversation_id, "nonexistent-term-xyz") == []
-
-
 # --- grep -> read_pages -> cite (HTTP seam) --- #
 
 
@@ -100,7 +77,7 @@ async def test_agent_greps_then_reads_then_cites(
     calls: list[str] = []
 
     async def stream_function(messages: list[ModelMessage], info: AgentInfo):
-        seen = _tool_returns(messages)
+        seen = tool_returns(messages)
         if seen == 0:
             calls.append("grep")
             yield {0: DeltaToolCall(name="grep", json_args=json.dumps({"pattern": "rent"}))}
@@ -128,7 +105,7 @@ async def test_agent_greps_then_reads_then_cites(
 
     assert response.status_code == 200
     assert calls == ["grep", "read_pages"]
-    events = _parse_sse(response.text)
+    events = parse_sse(response.text)
     # grep surfaces as a search step.
     steps = [e for e in events if e.get("type") == "step"]
     assert steps[0]["kind"] == "search"

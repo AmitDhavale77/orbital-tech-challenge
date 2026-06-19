@@ -40,6 +40,7 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "ruff>=0.8.0",
     "pyright>=1.1.0",
+    "asyncpg-stubs>=0.30.0",
 ]
 
 [tool.ruff]
@@ -61,8 +62,3 @@ extraPaths = ["backend/src"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["backend/tests"]
-# Opt-in real-LLM eval suite is excluded from the default run; run with `-m slow`.
-addopts = ["-m", "not slow"]
-markers = [
-    "slow: opt-in evals that call the real model (excluded from the default run)",
-]

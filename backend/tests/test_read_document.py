@@ -1,32 +1,16 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from httpx import AsyncClient
-from pydantic_ai.messages import ModelMessage, ToolReturnPart
+from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.db.models import Conversation, Document, Page
 from takehome.services.document import get_document_text, get_pages_text
 from takehome.services.llm import qa_agent
-
-
-def _parse_sse(body: str) -> list[dict[str, Any]]:
-    return [
-        json.loads(line[len("data: ") :])
-        for line in body.splitlines()
-        if line.startswith("data: ")
-    ]
-
-
-def _tool_returns(messages: list[ModelMessage]) -> int:
-    return sum(
-        isinstance(part, ToolReturnPart)
-        for message in messages
-        for part in getattr(message, "parts", [])
-    )
+from tests.helpers import parse_sse, tool_returns
 
 
 async def _seed_doc(db: AsyncSession) -> tuple[str, str]:
@@ -105,7 +89,7 @@ async def test_agent_reads_a_page_range_then_cites(
     calls: list[str] = []
 
     async def stream_function(messages: list[ModelMessage], info: AgentInfo):
-        seen = _tool_returns(messages)
+        seen = tool_returns(messages)
         if seen == 0:
             calls.append("read_pages")
             yield {0: DeltaToolCall(name="read_pages", json_args=json.dumps({"document_id": lease_id, "start_page": 1, "end_page": 2}))}
@@ -120,7 +104,7 @@ async def test_agent_reads_a_page_range_then_cites(
 
     assert response.status_code == 200
     assert calls == ["read_pages"]
-    events = _parse_sse(response.text)
+    events = parse_sse(response.text)
     message = next(e["message"] for e in events if e.get("type") == "message")
     assert message["citations"][0]["page"] == 1
 
@@ -131,7 +115,7 @@ async def test_read_pages_step_streams_live_and_persists(
     conversation_id, lease_id = await _seed_doc(db_session)
 
     async def stream_function(messages: list[ModelMessage], info: AgentInfo):
-        seen = _tool_returns(messages)
+        seen = tool_returns(messages)
         if seen == 0:
             yield {0: DeltaToolCall(name="read_pages", json_args=json.dumps({"document_id": lease_id, "start_page": 1, "end_page": 3}))}
         else:
@@ -143,7 +127,7 @@ async def test_read_pages_step_streams_live_and_persists(
             json={"content": "What is the permitted use?"},
         )
 
-    events = _parse_sse(response.text)
+    events = parse_sse(response.text)
     live_steps = [e for e in events if e.get("type") == "step"]
     assert [s["kind"] for s in live_steps] == ["read"]
     assert live_steps[0]["document_id"] == lease_id

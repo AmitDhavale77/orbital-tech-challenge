@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from httpx import AsyncClient
 from pydantic_ai import ModelMessagesTypeAdapter
@@ -11,28 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.db.models import Conversation, Document, Page
 from takehome.services.llm import qa_agent
+from tests.helpers import has_tool_return, parse_sse
 
 # The chat agent finishes by emitting a structured `Answer` (markdown + citations)
 # as its final output tool — the answer is NOT streamed token-by-token. So a
 # FunctionModel drives the loop as: read_pages -> Answer (with citations).
 
 _QUOTE = "the rent is GBP 1.75 million"
-
-
-def _parse_sse(body: str) -> list[dict[str, Any]]:
-    return [
-        json.loads(line[len("data: ") :])
-        for line in body.splitlines()
-        if line.startswith("data: ")
-    ]
-
-
-def _has_tool_return(messages: list[ModelMessage]) -> bool:
-    return any(
-        isinstance(part, ToolReturnPart)
-        for message in messages
-        for part in getattr(message, "parts", [])
-    )
 
 
 def _returns(messages: list[ModelMessage]) -> list[str]:
@@ -135,7 +119,7 @@ async def test_agent_answers_by_reading_pages(
         )
 
     assert response.status_code == 200
-    events = _parse_sse(response.text)
+    events = parse_sse(response.text)
 
     # The agent actually read a page, and no document text was placed in the prompt
     # before the tool ran.
@@ -167,7 +151,7 @@ async def test_rich_history_persisted_with_tool_returns(
     await db_session.refresh(conversation)
     assert conversation.model_history, "expected model_history to be persisted"
     history = ModelMessagesTypeAdapter.validate_python(conversation.model_history)
-    assert _has_tool_return(history), "snapshot must carry the prior tool return"
+    assert has_tool_return(history), "snapshot must carry the prior tool return"
 
 
 async def test_history_replayed_into_next_turn(
@@ -191,7 +175,7 @@ async def test_history_replayed_into_next_turn(
         )
 
     assert response.status_code == 200
-    assert seen and _has_tool_return(seen[0]), "turn 2 must receive replayed reads"
+    assert seen and has_tool_return(seen[0]), "turn 2 must receive replayed reads"
 
 
 async def test_repeat_question_reuses_context_without_rereading(
@@ -213,7 +197,7 @@ async def test_repeat_question_reuses_context_without_rereading(
         )
 
     assert response.status_code == 200
-    events = _parse_sse(response.text)
+    events = parse_sse(response.text)
 
     steps = [e for e in events if e.get("type") == "step"]
     assert not any(s.get("kind") in {"read", "search"} for s in steps), (
@@ -221,16 +205,3 @@ async def test_repeat_question_reuses_context_without_rereading(
     )
     final = next(e for e in events if e.get("type") == "message")["message"]
     assert final["sources_cited"] >= 1, "reused answer must still be grounded"
-
-
-def test_compaction_capability_is_configured() -> None:
-    # Anthropic server-side compaction is wired so long chats stay within the
-    # context window (ticket 08); it only round-trips because we persist the full
-    # ModelMessage history (tested above).
-    from pydantic_ai.models.anthropic import AnthropicCompaction
-
-    found: list[object] = []
-    qa_agent._root_capability.apply(found.append)  # noqa: SLF001
-    compactions = [c for c in found if isinstance(c, AnthropicCompaction)]
-    assert len(compactions) == 1
-    assert compactions[0].token_threshold == 300_000

@@ -79,13 +79,13 @@ fmt: fmt-backend fmt-frontend
 
 # Python checks
 check-backend:
-    docker compose exec backend uv run ruff check backend/src
-    docker compose exec backend uv run pyright backend/src
+    docker compose exec backend uv run ruff check backend/src backend/tests
+    docker compose exec backend uv run pyright backend/src backend/tests
 
 # Format Python
 fmt-backend:
-    docker compose exec backend uv run ruff format backend/src
-    docker compose exec backend uv run ruff check --fix backend/src
+    docker compose exec backend uv run ruff format backend/src backend/tests
+    docker compose exec backend uv run ruff check --fix backend/src backend/tests
 
 # Frontend checks
 check-frontend:
@@ -99,13 +99,9 @@ fmt-frontend:
 # Tests
 # =============================================================================
 
-# Backend tests (pytest against a dedicated test database; excludes slow evals)
+# Backend tests (pytest against a dedicated test database)
 test:
     docker compose exec backend uv run pytest backend/tests
-
-# Opt-in real-LLM eval suite (ticket 07) — calls the real model, costs API usage
-eval:
-    docker compose exec backend uv run pytest -m slow -v
 
 # =============================================================================
 # Utilities

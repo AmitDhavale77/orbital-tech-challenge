@@ -1,10 +1,8 @@
-"""Per-document routing cards (ticket 06).
+"""Per-document routing cards.
 
-A card is a cheap, structured summary generated at ingest (Haiku) so the agent
-can route across the bundle. It is a **routing hint only — never a Source**: the
-agent must never cite a card; only `read_page` text is citable (ADR-0002).
-
-Kept in a leaf module (no imports from `document`/`llm`) to avoid an import cycle.
+We generate a small card for each document when it is uploaded. The card gives
+the agent a quick sense of what the document is, so it can decide which files are
+worth opening for a particular question.
 """
 
 from __future__ import annotations

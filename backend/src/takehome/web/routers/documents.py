@@ -57,7 +57,6 @@ async def upload_document_endpoint(
     A conversation owns many documents, but the same PDF cannot be uploaded twice
     into one bundle — an identical file returns 409.
     """
-    # Verify the conversation exists
     conversation = await get_conversation(session, conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")

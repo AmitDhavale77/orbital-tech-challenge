@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from httpx import AsyncClient
 from pydantic_ai.messages import ModelMessage
@@ -10,14 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.db.models import Conversation, Document, Page
 from takehome.services.llm import qa_agent
-
-
-def _parse_sse(body: str) -> list[dict[str, Any]]:
-    return [
-        json.loads(line[len("data: ") :])
-        for line in body.splitlines()
-        if line.startswith("data: ")
-    ]
+from tests.helpers import parse_sse
 
 
 async def test_only_verified_citations_are_returned_and_persisted(
@@ -64,7 +56,7 @@ async def test_only_verified_citations_are_returned_and_persisted(
         )
 
     assert response.status_code == 200
-    events = _parse_sse(response.text)
+    events = parse_sse(response.text)
 
     # Final message event carries exactly the one verified citation.
     final = [e for e in events if e.get("type") == "message"]

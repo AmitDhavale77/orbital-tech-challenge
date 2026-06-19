@@ -39,13 +39,6 @@ from takehome.services import (
 )
 from takehome.services.citations import Answer, GroundedAnswer, verify_and_renumber
 
-# Bounds the worst-case latency/cost of the agentic loop (docs/pydantic-ai.md §9).
-# Navigation (grep/read_pages) means a thorough question makes many small tool
-# calls before it can answer, so the loop is sized generously; server-side
-# compaction keeps a long loop within the context window. Breadth across a large
-# 12–50-doc bundle is handled by the parallel fan-out batch path
-# (services/portfolio.py), not this sequential chat loop. All knobs live in
-# config.py.
 CHAT_USAGE_LIMITS = UsageLimits(
     total_tokens_limit=settings.chat_total_tokens_limit,
 )
@@ -167,42 +160,38 @@ class Step(BaseModel):
 
 @dataclass
 class AppDeps:
-    """Per-run dependencies injected into the agent's tools."""
+    """Dependencies passed into the agent for each run."""
 
     db: AsyncSession
     conversation_id: str
-    # Side-channel for a tool to push live Steps onto the run's SSE queue (used by
-    # summarize_documents to stream per-document progress). None outside a stream.
+    # Lets tools push live progress steps to the SSE stream.
+    # Used by summarize_documents for per-document updates.
+    # This is None when the run is not being streamed.
     step_sink: Callable[[Step], None] | None = None
 
 
-# Cache only the stable prefix — system prompt + tool definitions — never a
-# preloaded document (docs/pydantic-ai.md §8, CLAUDE.md context-management rule).
+# Cache only the stable parts of the prompt: instructions and tool definitions.
+# Do not cache preloaded documents, since they change per conversation.
 QA_SETTINGS = AnthropicModelSettings(
     anthropic_cache_instructions=True,
     anthropic_cache_tool_definitions=True,
 )
 
-# Anthropic server-side compaction: once a conversation's replayed history exceeds
-# the threshold, the model summarises older turns server-side and surfaces a
-# CompactionPart we round-trip via the persisted ModelMessage history (docs §7).
-# The threshold sits below CHAT_USAGE_LIMITS' hard cap, so compaction (graceful)
-# fires before UsageLimitExceeded (degrade). Inert until a long, page-heavy chat
-# actually grows; needs a compaction-capable model (Sonnet 4.6 ✓, not Haiku).
+
+# Anthropic can compact long conversations before they hit the hard usage limit.
+# When the replayed history gets too large, older turns are summarized and stored
+# as a CompactionPart in the persisted ModelMessage history.
+
 qa_agent = Agent(
     AnthropicModel(settings.qa_model),
     deps_type=AppDeps,
-    # Typed output: the agent finishes by emitting an `Answer` (markdown +
-    # citations) as its final tool call. The run can ONLY end via that tool, so
-    # the model can never end a turn mid-tool-loop with stray text, and citations
-    # ride along with the answer (no separate `cite` tool). The answer is not
-    # streamed token-by-token — it is returned whole once the tool loop completes.
     output_type=Answer,
     instructions=INSTRUCTIONS,
     model_settings=QA_SETTINGS,
     capabilities=[AnthropicCompaction(token_threshold=settings.compaction_token_threshold)],
     retries=settings.agent_retries,
 )
+
 
 
 @qa_agent.instructions
@@ -473,15 +462,16 @@ async def answer_question(
     no document text is placed in the prompt; `message_history` carries prior
     turns (including pages already read) so a repeat needn't re-read (docs §6).
     """
-    # Pre-fetch filenames so the event handler can label tool steps without a DB
-    # round-trip during the run.
+
+
     docs = await document_service.list_documents_for_conversation(db, conversation_id)
     names = {d.id: d.filename for d in docs}
 
-    # The agent run (tools + verification) runs as a task and pushes items onto a
-    # queue; we yield them in arrival order so steps appear live. The queue's
-    # put_nowait doubles as the deps' step_sink, so a tool (summarize_documents)
-    # can stream its own per-document Steps onto the same queue mid-run.
+    # Run the agent in the background while it pushes updates onto this queue.
+    # We yield items as they arrive so progress appears live in the stream.
+    #
+    # queue.put_nowait is also passed into deps as step_sink, which lets tools like
+    # summarize_documents send their own per-document progress updates mid-run.
     queue: asyncio.Queue[str | Step | GroundedAnswer | None] = asyncio.Queue()
     deps = AppDeps(
         db=db, conversation_id=conversation_id, step_sink=queue.put_nowait
@@ -507,10 +497,12 @@ async def answer_question(
                 usage_limits=CHAT_USAGE_LIMITS,
                 event_stream_handler=on_event,
             ) as result:
-                # No token streaming: drive the run to completion (tool steps still
-                # stream live via event_stream_handler) and take the whole Answer.
-                # get_output() finalises the run, so all_messages() includes this
-                # turn's tool calls/returns and the final structured output.
+
+                # No token streaming: run to completion and return the full Answer.
+                # Tool progress still streams live via event_stream_handler.
+                # get_output() finalises the run, so all messages include this turn's tools
+                # and final structured output.
+
                 answer = await result.get_output()
                 serialized_history = to_jsonable_python(result.all_messages())
             markdown, verified = await verify_and_renumber(
