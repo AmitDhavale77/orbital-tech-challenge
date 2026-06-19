@@ -233,4 +233,4 @@ def test_compaction_capability_is_configured() -> None:
     qa_agent._root_capability.apply(found.append)  # noqa: SLF001
     compactions = [c for c in found if isinstance(c, AnthropicCompaction)]
     assert len(compactions) == 1
-    assert compactions[0].token_threshold == 150_000
+    assert compactions[0].token_threshold == 300_000

@@ -203,7 +203,7 @@ qa_agent = Agent(
     output_type=Answer,
     instructions=INSTRUCTIONS,
     model_settings=_QA_SETTINGS,
-    capabilities=[AnthropicCompaction(token_threshold=150_000)],
+    capabilities=[AnthropicCompaction(token_threshold=300_000)],
     retries=2,
 )
 
