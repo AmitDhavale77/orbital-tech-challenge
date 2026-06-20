@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { Bot } from "lucide-react";
+import { Bot, Sparkles } from "lucide-react";
 import { type Components, Streamdown } from "streamdown";
 import "streamdown/styles.css";
 import {
@@ -190,12 +190,14 @@ const streamingCitationComponents: Components = {
 interface StreamingBubbleProps {
 	content: string;
 	steps?: Step[];
+	reasoning?: string;
 	onStepClick?: (step: Step) => void;
 }
 
 export function StreamingBubble({
 	content,
 	steps = [],
+	reasoning = "",
 	onStepClick,
 }: StreamingBubbleProps) {
 	return (
@@ -204,6 +206,17 @@ export function StreamingBubble({
 				<Bot className="h-4 w-4 text-white" />
 			</div>
 			<div className="min-w-0 max-w-[80%]">
+				{reasoning && (
+					<div className="mb-2 rounded-lg border border-neutral-200 bg-neutral-50 px-2 py-1.5 text-xs">
+						<div className="flex items-center gap-1.5 font-medium text-neutral-500">
+							<Sparkles className="h-3 w-3" />
+							Thinking…
+						</div>
+						<div className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap italic text-neutral-500">
+							{reasoning}
+						</div>
+					</div>
+				)}
 				{steps.length > 0 && (
 					<AgentSteps steps={steps} live onStepClick={onStepClick} />
 				)}
@@ -218,7 +231,7 @@ export function StreamingBubble({
 						</Streamdown>
 						<span className="inline-block h-4 w-0.5 animate-pulse bg-neutral-400" />
 					</div>
-				) : steps.length === 0 ? (
+				) : steps.length === 0 && !reasoning ? (
 					<div className="flex items-center gap-1 py-2">
 						<span className="h-1.5 w-1.5 animate-pulse rounded-full bg-neutral-400" />
 						<span

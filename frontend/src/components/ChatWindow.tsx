@@ -12,6 +12,7 @@ interface ChatWindowProps {
 	streaming: boolean;
 	streamingContent: string;
 	streamingSteps: Step[];
+	streamingReasoning: string;
 	hasDocument: boolean;
 	conversationId: string | null;
 	onSend: (content: string) => void;
@@ -27,6 +28,7 @@ export function ChatWindow({
 	streaming,
 	streamingContent,
 	streamingSteps,
+	streamingReasoning,
 	hasDocument,
 	conversationId,
 	onSend,
@@ -114,6 +116,7 @@ export function ChatWindow({
 						<StreamingBubble
 							content={streamingContent}
 							steps={streamingSteps}
+							reasoning={streamingReasoning}
 							onStepClick={onStepClick}
 						/>
 					)}

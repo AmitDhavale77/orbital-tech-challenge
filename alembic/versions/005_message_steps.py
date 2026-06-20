@@ -1,7 +1,7 @@
 """Add steps JSON column to messages (agent trace)
 
 Revision ID: 005_message_steps
-Revises: 004_page_tsv
+Revises: 003_message_citations
 Create Date: 2026-06-14 00:00:00.000000
 """
 
@@ -14,7 +14,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "005_message_steps"
-down_revision: str | None = "004_page_tsv"
+down_revision: str | None = "003_message_citations"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

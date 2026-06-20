@@ -99,6 +99,39 @@ async def _first_turn(
     assert response.status_code == 200
 
 
+async def test_agent_narration_streams_as_reasoning(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # The model's natural between-tool text is streamed as `reasoning` events (the
+    # live "thinking" track), separate from the answer body, which still arrives via
+    # the structured output tool and is unpolluted by the narration.
+    conversation, document = await _seed_doc(db_session)
+
+    async def fn(messages: list[ModelMessage], info: AgentInfo):
+        if "read_pages" not in _returns(messages):
+            yield "Let me read page 1 to find the rent."
+            yield _read_call(document)
+        else:
+            yield _answer_call(info, document)
+
+    with qa_agent.override(model=FunctionModel(stream_function=fn)):
+        response = await client.post(
+            f"/api/conversations/{conversation.id}/messages",
+            json={"content": "What is the rent?"},
+        )
+
+    assert response.status_code == 200
+    events = parse_sse(response.text)
+
+    reasoning = [e for e in events if e.get("type") == "reasoning"]
+    assert reasoning, "expected the model's narration streamed as reasoning events"
+    assert "Let me read" in "".join(e["delta"] for e in reasoning)
+
+    final = next(e for e in events if e.get("type") == "message")["message"]
+    assert "Let me read" not in final["content"], "narration must not leak into the answer"
+    assert "GBP 1.75 million" in final["content"]
+
+
 async def test_agent_answers_by_reading_pages(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:

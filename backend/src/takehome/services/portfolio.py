@@ -1,20 +1,13 @@
-"""Bundle-wide document analysis — the breadth path.
+"""Bundle-wide document analysis.
 
-For questions that must look across many documents at once ("summarise the
-bundle", "which leases grant parking rights?"), the sequential chat loop can't
-scale: one read per doc, capped tool calls. So the `summarize_documents` chat
-tool calls in here to fan out a cheap per-document pass IN PARALLEL — each
-document is read whole and summarised in its own isolated LLM context (Haiku),
-returning a summary plus verbatim, page-verified quotes.
+Used when a question needs to look across many documents, such as "summarise the
+bundle" or "which leases grant parking rights?".
 
-There is no reduce step here: the chat agent in `llm.py` *is* the reduce. It
-receives these findings and synthesises + cites the answer itself. Keeping each
-document's full text out of the chat agent's context is the whole point — only
-the distilled summary + verified quotes ever reach it.
+Each document is analysed separately and in parallel. The chat agent then uses
+the returned summaries and verified quotes to write the final answer, without
+loading every full document into its own context.
 
-Grounding is preserved: every quote is verified against its page
-(`verify_and_renumber`), so a quote the model paraphrased or stitched together is
-dropped before it can become a citation.
+Quotes are checked against the page text before they can be used as citations.
 """
 
 from __future__ import annotations
@@ -85,10 +78,6 @@ class DocFinding(BaseModel):
     citations: list[VerifiedCitation] = []
 
 
-# Haiku for the per-doc map: it's a one-shot structured call (no tools, no loop)
-# run N× in parallel, so the cheap model is the right choice (CLAUDE.md policy).
-# It's an `Agent` only for the typed output + `agent.override(TestModel)` test
-# seam — not a tool-using sub-agent.
 map_agent = Agent(
     settings.map_model, output_type=MapResult, instructions=MAP_INSTRUCTIONS
 )
@@ -108,12 +97,14 @@ async def map_one(
     document_name: str,
     question: str,
     on_doc: Callable[[str, str], None] | None = None,
+    on_done: Callable[[DocFinding], None] | None = None,
 ) -> DocFinding:
     """Map one document → a verified finding. Opens its own session so parallel
     map tasks never share a session (AsyncSession is not concurrency-safe).
 
     `on_doc(document_id, document_name)` (if given) fires as this document's map
-    begins, so a caller can stream live per-document progress.
+    begins; `on_done(finding)` (if given) fires once with the completed verdict.
+    Together they let a caller stream live per-document progress (start + result).
     """
     from takehome.db.session import async_session
 
@@ -125,45 +116,54 @@ async def map_one(
             session, conversation_id, document_id
         )
         if not text:
-            return DocFinding(
+            finding = DocFinding(
                 document_id=document_id, document_name=document_name, relevant=False
             )
-        result = await map_agent.run(map_prompt(question, document_name, text))
-        mapped = result.output
-        if not mapped.relevant:
-            return DocFinding(
-                document_id=document_id, document_name=document_name, relevant=False
-            )
-        citations = [
-            Citation(
-                document_id=document_id,
-                document_name=document_name,
-                page=q.page,
-                quote=q.quote,
-            )
-            for q in mapped.quotes
-        ]
+        else:
+            result = await map_agent.run(map_prompt(question, document_name, text))
+            mapped = result.output
+            if not mapped.relevant:
+                finding = DocFinding(
+                    document_id=document_id, document_name=document_name, relevant=False
+                )
+            else:
+                citations = [
+                    Citation(
+                        document_id=document_id,
+                        document_name=document_name,
+                        page=q.page,
+                        quote=q.quote,
+                    )
+                    for q in mapped.quotes
+                ]
+                # Verify only the quotes. The map summary is not an answer body, so we
+                # avoid citation-marker cleanup on prose that may contain harmless
+                # bracketed text.
+                _, verified = await verify_and_renumber(
+                    session, conversation_id, "", citations
+                )
+                if citations and not verified:
+                    # Relevant doc, but every quote failed the verbatim check (the map
+                    # model tends to elide / stitch quotes). The finding still carries
+                    # the summary, but the chat agent now has no citable evidence for
+                    # it — make that visible.
+                    logger.warning(
+                        "map_one: relevant document lost all quotes to verification",
+                        document_id=document_id,
+                        document_name=document_name,
+                        quotes=len(citations),
+                    )
+                finding = DocFinding(
+                    document_id=document_id,
+                    document_name=document_name,
+                    relevant=True,
+                    summary=mapped.summary,
+                    citations=verified,
+                )
 
-        # Verify only the quotes. The map summary is not an answer body, so we avoid
-        # running citation-marker cleanup on prose that may contain harmless bracketed text.
-        _, verified = await verify_and_renumber(session, conversation_id, "", citations)
-        if citations and not verified:
-            # Relevant doc, but every quote failed the verbatim check (Haiku tends to
-            # elide / stitch quotes). The finding still carries the summary, but the
-            # chat agent now has no citable evidence for it — make that visible.
-            logger.warning(
-                "map_one: relevant document lost all quotes to verification",
-                document_id=document_id,
-                document_name=document_name,
-                quotes=len(citations),
-            )
-        return DocFinding(
-            document_id=document_id,
-            document_name=document_name,
-            relevant=True,
-            summary=mapped.summary,
-            citations=verified,
-        )
+    if on_done is not None:
+        on_done(finding)
+    return finding
 
 
 async def gather_maps(
@@ -172,6 +172,7 @@ async def gather_maps(
     meta: list[tuple[str, str]],
     concurrency: int,
     on_doc: Callable[[str, str], None] | None = None,
+    on_done: Callable[[DocFinding], None] | None = None,
 ) -> list[DocFinding]:
     """Run `map_one` over (document_id, document_name) pairs in parallel, capped
     by a semaphore so a large bundle doesn't open one LLM request (and session)
@@ -179,14 +180,15 @@ async def gather_maps(
 
     One document's failure (LLM/API error, oversized doc) must not sink the whole
     breadth answer, so a failed map degrades to a non-relevant finding rather than
-    propagating out of the tool.
+    propagating out of the tool. `on_done` still fires for a degraded finding, so
+    every document reports a verdict to the live trace.
     """
     semaphore = asyncio.Semaphore(concurrency)
 
     async def guarded(document_id: str, document_name: str) -> DocFinding:
         async with semaphore:
             return await map_one(
-                conversation_id, document_id, document_name, question, on_doc
+                conversation_id, document_id, document_name, question, on_doc, on_done
             )
 
     results = await asyncio.gather(
@@ -201,13 +203,14 @@ async def gather_maps(
                 document_name=document_name,
                 exc_info=result,
             )
-            findings.append(
-                DocFinding(
-                    document_id=document_id,
-                    document_name=document_name,
-                    relevant=False,
-                )
+            degraded = DocFinding(
+                document_id=document_id,
+                document_name=document_name,
+                relevant=False,
             )
+            if on_done is not None:
+                on_done(degraded)
+            findings.append(degraded)
         else:
             findings.append(result)
     return findings
@@ -220,14 +223,16 @@ async def map_documents(
     *,
     concurrency: int = settings.map_concurrency,
     on_doc: Callable[[str, str], None] | None = None,
+    on_done: Callable[[DocFinding], None] | None = None,
 ) -> list[DocFinding]:
     """Map the named documents in PARALLEL → one finding each (no reduce).
 
     Backs the `summarize_documents` chat tool: each requested document is read and
     summarised in its own isolated context (Haiku), returning a summary plus
     verbatim, page-verified quotes. The chat agent reduces these into the answer,
-    so the work stops at the map. Ids not in the bundle are skipped. `on_doc` (if
-    given) fires per document as its map begins, for live progress.
+    so the work stops at the map. Ids not in the bundle are skipped. `on_doc` fires
+    per document as its map begins and `on_done` once it completes (with the
+    verdict), for live progress.
     """
     from takehome.db.session import async_session
 
@@ -237,4 +242,6 @@ async def map_documents(
         )
     wanted = set(document_ids)
     meta = [(d.id, d.filename) for d in documents if d.id in wanted]
-    return await gather_maps(conversation_id, question, meta, concurrency, on_doc)
+    return await gather_maps(
+        conversation_id, question, meta, concurrency, on_doc, on_done
+    )

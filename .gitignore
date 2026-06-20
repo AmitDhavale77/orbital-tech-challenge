@@ -27,7 +27,6 @@ docs/*
 .claude/*.local.*
 .claude/skills/
 CLAUDE.local.md
-docs/technical.md
 
 # IDE
 .vscode/

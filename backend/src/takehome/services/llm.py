@@ -20,6 +20,10 @@ from pydantic_ai.messages import (
     AgentStreamEvent,
     FunctionToolCallEvent,
     ModelMessage,
+    PartDeltaEvent,
+    PartStartEvent,
+    TextPart,
+    TextPartDelta,
     ToolCallPart,
 )
 from pydantic_ai.models.anthropic import (
@@ -88,9 +92,9 @@ help as soon as they add some. Call no other tool.
 3. Otherwise use the cards only as routing hints (never quote or cite them) to decide which \
 documents could bear on the question. Check EVERY document that plausibly could — not just the \
 first match. Then:
-   - Targeted — a specific fact, term, clause, date, or party in a small, known set of documents (roughly 1–3) → grep + read_pages (steps 4–5).
-   - Breadth — the answer needs whole-document summaries, or compares/aggregates across more than a handful of documents (e.g. "summarise the bundle", "across all the leases, which grant parking?") → call `summarize_documents(question, document_ids)` with the relevant ids, then answer from its returned summaries and quotes (skip steps 4–5).
-4. Locate pages with `grep`. Page text can wrap mid-phrase, so put `\\s+` or \
+   - Targeted — anything scoped to a small, known set of documents (roughly 1–3): a specific fact (term, clause, date, party) OR a request to summarise or explain those particular documents. Read the relevant pages with `read_pages`; reach for `grep` first only to find where a specific term/clause sits in a long document. Summarising or explaining ONE named document is Targeted — read its pages, do NOT call `summarize_documents` for a single document (steps 4–5).
+   - Breadth — the question genuinely spans MANY documents (more than ~3) that must each be summarised and then compared or aggregated, where you do not already know which one holds the answer (e.g. "summarise the bundle", "across all the leases, which grant parking?") → call `summarize_documents(question, document_ids)` with the relevant ids, then answer ONLY from its returned summaries and quotes. Do NOT additionally `grep` or `read_pages` a document it already covered — its summary and verified quotes are your source (skip steps 4–5).
+4. When you need to find where a specific term/clause appears, locate pages with `grep` first (skip grep when you simply need to read or summarise a whole, short document — read its pages directly). Page text can wrap mid-phrase, so put `\\s+` or \
 `.*` between the words of a phrase rather than a literal space.
 5. Read located pages with `read_pages`. This returned text is the ONLY text you may quote and cite.
 6. Write your answer, with a citation for each supporting quote (see Citations), handling these cases:
@@ -156,6 +160,16 @@ class Step(BaseModel):
     label: str  # human-readable, e.g. 'Reading lease.pdf · p.4'
     document_id: str | None = None
     page: int | None = None
+    # Optional second line, e.g. a per-document map summary or verdict detail.
+    detail: str | None = None
+
+
+class Reasoning(BaseModel):
+    """A streamed chunk of the agent's between-tool narration — the natural-language
+    'thinking' text the model emits while deciding what to do next. Streamed live
+    (not persisted), separate from the final answer body."""
+
+    delta: str
 
 
 @dataclass
@@ -345,11 +359,14 @@ async def read_pages(
 async def summarize_documents(
     ctx: RunContext[AppDeps], question: str, document_ids: list[str]
 ) -> dict[str, object]:
-    """Summarise several whole documents at once — the breadth path.
+    """Summarise MANY whole documents at once — the breadth path.
 
-    Use this ONLY when the question is inherently about many documents together
-    (e.g. "summarise the bundle", "across all the leases, which grant parking?").
-    For a specific fact on known pages, use `grep` + `read_pages` instead.
+    Use this ONLY when the question spans many documents together (more than ~3) and
+    you do not already know which holds the answer (e.g. "summarise the bundle",
+    "across all the leases, which grant parking?"). For ONE document — even to
+    summarise or explain it — use `read_pages` (and `grep` to locate a term); never
+    call this for a single document. For a specific fact on known pages, use `grep` +
+    `read_pages` instead.
 
     Each named document is read and summarised in ITS OWN context, in parallel,
     returning a `summary` plus `quotes` copied verbatim from its pages. Write your
@@ -371,8 +388,10 @@ async def summarize_documents(
             "the documents you want summarised."
         )
 
-    # Stream one live Step per document as its map begins, so the breadth path's
-    # per-document work is visible in the live trace.
+    # Stream a live Step per document as its map begins, and another with the
+    # verdict once it completes, so the breadth path's per-document reasoning is
+    # visible in the live trace (which documents were relevant, with how much
+    # citable evidence) rather than just a single umbrella call.
     sink = ctx.deps.step_sink
 
     def on_doc(document_id: str, document_name: str) -> None:
@@ -385,8 +404,28 @@ async def summarize_documents(
                 )
             )
 
+    def on_done(finding: portfolio.DocFinding) -> None:
+        if sink is None:
+            return
+        if finding.relevant:
+            n = len(finding.citations)
+            label = (
+                f"{finding.document_name}: relevant · {n} quote"
+                f"{'' if n == 1 else 's'}"
+            )
+        else:
+            label = f"{finding.document_name}: not relevant"
+        sink(
+            Step(
+                kind="summarize",
+                label=label,
+                document_id=finding.document_id,
+                detail=finding.summary or None,
+            )
+        )
+
     findings = await portfolio.map_documents(
-        ctx.deps.conversation_id, question, chosen, on_doc=on_doc
+        ctx.deps.conversation_id, question, chosen, on_doc=on_doc, on_done=on_done
     )
     return {
         "findings": [
@@ -450,7 +489,7 @@ async def answer_question(
     conversation_id: str,
     question: str,
     message_history: list[ModelMessage] | None = None,
-) -> AsyncIterator[str | Step | GroundedAnswer]:
+) -> AsyncIterator[str | Step | Reasoning | GroundedAnswer]:
     """Stream the agent's answer over the conversation's bundle.
 
     Yields, in order of occurrence: `Step`s (the agent's tool actions, as they
@@ -472,7 +511,9 @@ async def answer_question(
     #
     # queue.put_nowait is also passed into deps as step_sink, which lets tools like
     # summarize_documents send their own per-document progress updates mid-run.
-    queue: asyncio.Queue[str | Step | GroundedAnswer | None] = asyncio.Queue()
+    queue: asyncio.Queue[str | Step | Reasoning | GroundedAnswer | None] = (
+        asyncio.Queue()
+    )
     deps = AppDeps(
         db=db, conversation_id=conversation_id, step_sink=queue.put_nowait
     )
@@ -487,6 +528,20 @@ async def answer_question(
                 if event.part.tool_name == "summarize_documents":
                     continue
                 queue.put_nowait(tool_step(event.part, names))
+            # The model's natural narration between tool calls — its "thinking".
+            # The final Answer arrives via the output tool (a ToolCallPart), not a
+            # TextPart, so this never carries the answer body. A part can carry
+            # initial text on start, then deltas; stream both.
+            elif isinstance(event, PartStartEvent) and isinstance(
+                event.part, TextPart
+            ):
+                if event.part.content:
+                    queue.put_nowait(Reasoning(delta=event.part.content))
+            elif isinstance(event, PartDeltaEvent) and isinstance(
+                event.delta, TextPartDelta
+            ):
+                if event.delta.content_delta:
+                    queue.put_nowait(Reasoning(delta=event.delta.content_delta))
 
     async def run() -> None:
         try:

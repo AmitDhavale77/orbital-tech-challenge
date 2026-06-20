@@ -9,6 +9,7 @@ export function useMessages(conversationId: string | null) {
 	const [streaming, setStreaming] = useState(false);
 	const [streamingContent, setStreamingContent] = useState("");
 	const [streamingSteps, setStreamingSteps] = useState<Step[]>([]);
+	const [streamingReasoning, setStreamingReasoning] = useState("");
 	const abortRef = useRef<AbortController | null>(null);
 
 	const refresh = useCallback(async () => {
@@ -56,6 +57,7 @@ export function useMessages(conversationId: string | null) {
 			setStreaming(true);
 			setStreamingContent("");
 			setStreamingSteps([]);
+			setStreamingReasoning("");
 			setError(null);
 
 			try {
@@ -97,6 +99,7 @@ export function useMessages(conversationId: string | null) {
 								label?: string;
 								document_id?: string | null;
 								page?: number | null;
+								detail?: string | null;
 							};
 
 							if (parsed.type === "step" && parsed.kind) {
@@ -105,9 +108,14 @@ export function useMessages(conversationId: string | null) {
 									label: parsed.label ?? "",
 									document_id: parsed.document_id ?? null,
 									page: parsed.page ?? null,
+									detail: parsed.detail ?? null,
 								};
 								collectedSteps.push(step);
 								setStreamingSteps((prev) => [...prev, step]);
+							} else if (parsed.type === "reasoning" && parsed.delta) {
+								// The agent's live narration — accumulate into a separate
+								// track, kept apart from the answer body.
+								setStreamingReasoning((prev) => prev + parsed.delta);
 							} else if (parsed.type === "delta" && parsed.delta) {
 								accumulated += parsed.delta;
 								setStreamingContent(accumulated);
@@ -155,6 +163,7 @@ export function useMessages(conversationId: string | null) {
 				setStreaming(false);
 				setStreamingContent("");
 				setStreamingSteps([]);
+				setStreamingReasoning("");
 			}
 		},
 		[conversationId, streaming],
@@ -167,6 +176,7 @@ export function useMessages(conversationId: string | null) {
 		streaming,
 		streamingContent,
 		streamingSteps,
+		streamingReasoning,
 		send,
 		refresh,
 	};

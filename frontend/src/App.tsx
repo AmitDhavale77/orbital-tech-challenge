@@ -34,12 +34,14 @@ export default function App() {
 		streaming,
 		streamingContent,
 		streamingSteps,
+		streamingReasoning,
 		send,
 	} = useMessages(selectedId);
 
 	const {
 		documents,
 		upload,
+		error: documentsError,
 		refresh: refreshDocuments,
 	} = useDocuments(selectedId);
 
@@ -100,10 +102,11 @@ export default function App() {
 				<ChatWindow
 					messages={messages}
 					loading={messagesLoading}
-					error={messagesError}
+					error={messagesError ?? documentsError}
 					streaming={streaming}
 					streamingContent={streamingContent}
 					streamingSteps={streamingSteps}
+					streamingReasoning={streamingReasoning}
 					hasDocument={documents.length > 0}
 					conversationId={selectedId}
 					onSend={handleSend}

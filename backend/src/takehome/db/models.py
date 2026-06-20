@@ -6,16 +6,14 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
-    Computed,
     DateTime,
     ForeignKey,
-    Index,
     Integer,
     String,
     Text,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -107,15 +105,9 @@ class Document(Base):
 
 
 class Page(Base):
-    """One page of a Document — the unit a Citation anchors to (ADR-0002).
-
-    `tsv` is the page's full-text vector, maintained by Postgres from `text`. It
-    backs the keyword `search` tool (page-level FTS + `ts_headline` previews);
-    chunk-level retrieval is deferred to the semantic upgrade (ADR-0002).
-    """
+    """One page of a Document — the unit a Citation anchors to (ADR-0002)."""
 
     __tablename__ = "pages"
-    __table_args__ = (Index("ix_pages_tsv", "tsv", postgresql_using="gin"),)
 
     id: Mapped[str] = mapped_column(
         String, primary_key=True, default=lambda: uuid.uuid4().hex[:16]
@@ -125,9 +117,5 @@ class Page(Base):
     )
     page_number: Mapped[int] = mapped_column(Integer)  # 1-based
     text: Mapped[str] = mapped_column(Text)
-    # Queried via @@ / ts_rank / ts_headline; never written from Python.
-    tsv: Mapped[Any] = mapped_column(
-        TSVECTOR, Computed("to_tsvector('english', text)", persisted=True)
-    )
 
     document: Mapped[Document] = relationship(back_populates="pages")

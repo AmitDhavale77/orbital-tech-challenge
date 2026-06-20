@@ -9,10 +9,25 @@ const BASE = "/api";
 
 async function handleResponse<T>(response: Response): Promise<T> {
 	if (!response.ok) {
-		const text = await response.text().catch(() => "Unknown error");
-		throw new Error(`API error ${response.status}: ${text}`);
+		throw new Error(await errorMessage(response));
 	}
 	return response.json() as Promise<T>;
+}
+
+/** Pull a human-readable message out of an error response: prefer the API's
+ * `{ detail }`, falling back to the raw body or the status. */
+async function errorMessage(response: Response): Promise<string> {
+	const text = await response.text().catch(() => "");
+	if (text) {
+		try {
+			const detail = (JSON.parse(text) as { detail?: unknown }).detail;
+			if (typeof detail === "string" && detail) return detail;
+		} catch {
+			// Body wasn't JSON — fall through to the raw text.
+		}
+		return text;
+	}
+	return `Request failed (${response.status})`;
 }
 
 export async function fetchConversations(): Promise<Conversation[]> {
@@ -34,8 +49,7 @@ export async function deleteConversation(id: string): Promise<void> {
 		method: "DELETE",
 	});
 	if (!res.ok) {
-		const text = await res.text().catch(() => "Unknown error");
-		throw new Error(`API error ${res.status}: ${text}`);
+		throw new Error(await errorMessage(res));
 	}
 }
 
@@ -63,8 +77,7 @@ export async function sendMessage(
 		body: JSON.stringify({ content }),
 	});
 	if (!res.ok) {
-		const text = await res.text().catch(() => "Unknown error");
-		throw new Error(`API error ${res.status}: ${text}`);
+		throw new Error(await errorMessage(res));
 	}
 	return res;
 }

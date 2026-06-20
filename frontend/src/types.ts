@@ -22,6 +22,8 @@ export interface Step {
 	label: string;
 	document_id: string | null;
 	page: number | null;
+	// Optional second line, e.g. a per-document map summary or verdict detail.
+	detail?: string | null;
 }
 
 export interface Message {

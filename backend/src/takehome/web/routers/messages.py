@@ -22,6 +22,7 @@ from takehome.services.conversation import (
     update_conversation,
 )
 from takehome.services.llm import (
+    Reasoning,
     Step,
     answer_question,
 )
@@ -162,6 +163,13 @@ async def send_message(
                     if isinstance(item, str):
                         full_response += item
                         event_data = json.dumps({"type": "content", "content": item})
+                        yield f"data: {event_data}\n\n"
+                    elif isinstance(item, Reasoning):
+                        # The agent's live between-tool narration. Streamed for the
+                        # UI's "Thinking…" track; intentionally not persisted.
+                        event_data = json.dumps(
+                            {"type": "reasoning", "delta": item.delta}
+                        )
                         yield f"data: {event_data}\n\n"
                     elif isinstance(item, Step):
                         steps.append(item)

@@ -48,8 +48,11 @@ function StepRow({
 		);
 	}
 	return (
-		<div className="flex items-center gap-1.5 px-1 py-0.5 text-neutral-500">
-			{body}
+		<div className="px-1 py-0.5 text-neutral-500">
+			<div className="flex items-center gap-1.5">{body}</div>
+			{step.detail && (
+				<div className="ml-[1.125rem] text-neutral-400">{step.detail}</div>
+			)}
 		</div>
 	);
 }

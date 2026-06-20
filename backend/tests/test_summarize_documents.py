@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from takehome.db.models import Conversation, Document, Page
 from takehome.services.llm import qa_agent
-from takehome.services.portfolio import map_agent, map_documents
+from takehome.services.portfolio import DocFinding, map_agent, map_documents
 from tests.helpers import last_user_text, page1, parse_sse, tool_returns
 
 LEASE_P1 = "The lease grants parking rights to the tenant."
@@ -390,3 +390,97 @@ async def test_map_documents_reports_each_document_via_on_doc(
     assert sorted(seen) == sorted(
         [(lease_id, "lease.pdf"), (deed_id, "deed.pdf")]
     )
+
+
+async def test_map_documents_reports_verdict_via_on_done(
+    sessionmaker: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`on_done` fires once per document with its completed verdict: a relevant doc
+    carries its verified quotes, an irrelevant one carries none. This backs the
+    per-document verdict step the chat tool streams after each map."""
+    import takehome.db.session as db_session_module
+
+    monkeypatch.setattr(db_session_module, "async_session", sessionmaker)
+    async with sessionmaker() as session:
+        conversation = Conversation()
+        session.add(conversation)
+        await session.flush()
+        lease = Document(
+            conversation_id=conversation.id, filename="lease.pdf", file_path="/tmp/lease.pdf", page_count=1
+        )
+        lease.pages = [Page(page_number=1, text=LEASE_P1)]
+        memo = Document(
+            conversation_id=conversation.id, filename="memo.pdf", file_path="/tmp/memo.pdf", page_count=1
+        )
+        memo.pages = [Page(page_number=1, text="Internal memo about the office coffee machine.")]
+        session.add_all([lease, memo])
+        await session.commit()
+        conv_id, lease_id, memo_id = conversation.id, lease.id, memo.id
+
+    done: list[DocFinding] = []
+    with map_agent.override(model=FunctionModel(_map_relevant_if_parking)):
+        await map_documents(
+            conv_id, "Which grant parking?", [lease_id, memo_id], on_done=done.append
+        )
+
+    by_id = {f.document_id: f for f in done}
+    assert set(by_id) == {lease_id, memo_id}
+    assert by_id[lease_id].relevant is True and by_id[lease_id].citations
+    assert by_id[memo_id].relevant is False and not by_id[memo_id].citations
+
+
+async def test_breadth_path_streams_per_document_verdict_steps(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The breadth path streams a verdict step per document (not just a single
+    umbrella call): a "relevant · N quote(s)" / "not relevant" label plus the map
+    summary as `detail`, so the agent's per-document reasoning is visible live."""
+    conv_id, lease_id, deed_id = await _seed_two_docs(db_session)
+
+    async def chat_fn(messages: list[ModelMessage], info: AgentInfo):
+        if tool_returns(messages) == 0:
+            yield {
+                0: DeltaToolCall(
+                    name="summarize_documents",
+                    json_args=json.dumps(
+                        {"question": "parking?", "document_ids": [lease_id, deed_id]}
+                    ),
+                )
+            }
+        else:
+            yield {
+                0: DeltaToolCall(
+                    name=info.output_tools[0].name,
+                    json_args=json.dumps(
+                        {
+                            "markdown": "Both grant parking[1][2].",
+                            "citations": [
+                                {"document_id": lease_id, "document_name": "lease.pdf", "page": 1, "quote": LEASE_P1},
+                                {"document_id": deed_id, "document_name": "deed.pdf", "page": 1, "quote": DEED_P1},
+                            ],
+                        }
+                    ),
+                )
+            }
+
+    with (
+        qa_agent.override(model=FunctionModel(stream_function=chat_fn)),
+        map_agent.override(model=FunctionModel(_map_returns_its_page1)),
+    ):
+        response = await client.post(
+            f"/api/conversations/{conv_id}/messages",
+            json={"content": "Which documents grant parking rights?"},
+        )
+
+    assert response.status_code == 200, response.text
+    events = parse_sse(response.text)
+    summarize = [
+        e for e in events if e.get("type") == "step" and e.get("kind") == "summarize"
+    ]
+    verdicts = [e for e in summarize if "relevant" in e["label"]]
+    # One verdict step per document, each carrying its single verified quote count
+    # and the map summary as detail.
+    assert len(verdicts) == 2
+    assert {e["document_id"] for e in verdicts} == {lease_id, deed_id}
+    assert all("relevant · 1 quote" in e["label"] for e in verdicts)
+    assert all(e.get("detail") for e in verdicts)
